@@ -19,7 +19,7 @@ Join the [Discord](https://discord.gg/UxAAvZ93) for support / discussion.
 
 ## About
 
-A faster, modern Mac package manager.
+A fast, modern package manager.
 
 ![zb demo](zb-demo.gif)
 
@@ -38,12 +38,28 @@ This leads to dramatic speedups, up to 5x cold and 20x warm. Full benchmarks [he
 ##  Using `zb`
 
 ```bash
-zb install jq        # install jq
-zb install wget git  # install multiple
-zb uninstall jq      # uninstall
-zb reset         # uninstall everything
-zb gc                # garbage collect unused store entries
+zb install jq                   # install jq
+zb install wget git             # install multiple
+zb install --file Brewfile      # install from a manifest
+zb bundle                       # shorthand for Brewfile in current dir
+zb uninstall jq                 # uninstall
+zb reset                        # uninstall everything
+zb gc                           # garbage collect unused store entries
+zbx jq --version                # run without linking
 ```
+
+### Brewfile manifests
+
+Create a plain text manifest (compatible with Homebrew's Brewfile) listing one formula per line:
+
+```text
+# Brewfile
+jq
+wget
+git
+```
+
+Blank lines and comments (lines starting with `#`) are ignored. Install everything in the manifest with `zb install --file Brewfile` or use `zb bundle` to read the default `./Brewfile`.
 
 ## Why is it faster?
 
@@ -107,4 +123,4 @@ Experimental. works for most core homebrew packages. Some formulas may need more
 
 ## License
 
-zerobrew is dual-licensed, usable under both [Apache](./LICENSE-APACHE.md) and [MIT](./LICENSE-MIT.md)
+zerobrew is dual-licensed, usable under both [Apache](./LICENSE-APACHE.md) OR [MIT](./LICENSE-MIT.md), at your choice.
