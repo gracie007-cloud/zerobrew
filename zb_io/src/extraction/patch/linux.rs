@@ -10,7 +10,7 @@ use zb_core::Error;
 
 /// Patch @@HOMEBREW_CELLAR@@ and @@HOMEBREW_PREFIX@@ placeholders in both ELF binaries and text files.
 #[cfg(target_os = "linux")]
-pub(crate) fn patch_placeholders(
+pub fn patch_placeholders(
     keg_path: &Path,
     prefix_dir: &Path,
     _pkg_name: &str,
@@ -272,19 +272,17 @@ fn patch_elf_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Erro
             }
             fs::rename(temp_path, path)?;
 
+            // Restore original permissions (including execute bit) after atomic write
+            let mut perms = metadata.permissions();
+            perms.set_mode(original_mode);
+            fs::set_permissions(path, perms)?;
+
             Ok(())
         })();
 
         if let Err(e) = result {
             eprintln!("Warning: Failed to patch ELF at {}: {}", path.display(), e);
             patch_failures.fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Restore permissions
-        if is_readonly {
-            let mut perms = metadata.permissions();
-            perms.set_mode(original_mode);
-            let _ = fs::set_permissions(path, perms);
         }
     });
 
@@ -335,15 +333,17 @@ fn patch_text_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Err
                 Err(_) => return Ok(()), // Not valid UTF-8, skip
             };
 
-            if !content.contains("@@HOMEBREW_PREFIX@@") && !content.contains("@@HOMEBREW_CELLAR@@")
-            {
+            if !content.contains("@@HOMEBREW_") {
                 return Ok(());
             }
 
-            // Replace
             let new_content = content
                 .replace("@@HOMEBREW_PREFIX@@", &prefix_str)
-                .replace("@@HOMEBREW_CELLAR@@", &cellar_str);
+                .replace("@@HOMEBREW_CELLAR@@", &cellar_str)
+                .replace("@@HOMEBREW_REPOSITORY@@", &prefix_str)
+                .replace("@@HOMEBREW_LIBRARY@@", &format!("{}/Library", prefix_str))
+                .replace("@@HOMEBREW_PERL@@", "/usr/bin/perl")
+                .replace("@@HOMEBREW_JAVA@@", "/usr/bin/java");
 
             // Write back
             // Check readonly
@@ -425,7 +425,7 @@ mod tests {
         let script_path = bin_dir.join("script.sh");
         fs::write(
             &script_path,
-            "#!/bin/bash\necho @@HOMEBREW_PREFIX@@\necho @@HOMEBREW_CELLAR@@",
+            "#!/bin/bash\necho @@HOMEBREW_PREFIX@@\necho @@HOMEBREW_CELLAR@@\necho @@HOMEBREW_LIBRARY@@\necho @@HOMEBREW_PERL@@",
         )
         .unwrap();
 
@@ -435,7 +435,9 @@ mod tests {
         let content = fs::read_to_string(&script_path).unwrap();
         assert!(content.contains(prefix.to_str().unwrap()));
         assert!(content.contains(cellar.to_str().unwrap()));
-        assert!(!content.contains("@@HOMEBREW_PREFIX@@"));
+        assert!(content.contains(&format!("{}/Library", prefix.to_str().unwrap())));
+        assert!(content.contains("/usr/bin/perl"));
+        assert!(!content.contains("@@HOMEBREW_"));
     }
 
     #[test]
@@ -457,11 +459,23 @@ mod tests {
             }
         };
 
+        // Record original permissions (should include execute bit from cc)
+        let original_mode = fs::metadata(&elf_path).unwrap().permissions().mode();
+        assert!(
+            original_mode & 0o111 != 0,
+            "compiled binary should be executable"
+        );
+
         let result = patch_placeholders(&pkg_dir, &prefix, "testpkg", "1.0.0");
         assert!(result.is_ok());
 
-        // Basic check that file is still intact
-        assert!(fs::metadata(&elf_path).is_ok());
+        // Verify permissions are preserved after patching
+        let new_mode = fs::metadata(&elf_path).unwrap().permissions().mode();
+        assert_eq!(
+            original_mode & 0o777,
+            new_mode & 0o777,
+            "permissions should be preserved after patching"
+        );
     }
 
     #[test]

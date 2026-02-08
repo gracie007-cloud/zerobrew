@@ -1,8 +1,8 @@
 use console::style;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use zb_io::install::Installer;
+use zb_io::Installer;
 
 use crate::utils::normalize_formula_name;
 
@@ -68,11 +68,57 @@ pub async fn execute(
         style(&formula).green()
     );
 
-    let err = Command::new(&bin_path).args(&args).exec();
+    let mut cmd = Command::new(&bin_path);
+    cmd.args(&args);
+
+    if let Some(prefix_path) = detect_runtime_prefix(&bin_path) {
+        if let Some(ca_bundle) = zb_io::find_ca_bundle_from_prefix(&prefix_path) {
+            cmd.env("CURL_CA_BUNDLE", &ca_bundle);
+            cmd.env("SSL_CERT_FILE", &ca_bundle);
+        }
+
+        if let Some(ca_dir) = zb_io::find_ca_dir(&prefix_path) {
+            cmd.env("SSL_CERT_DIR", &ca_dir);
+        }
+
+        let lib_path = prefix_path.join("lib");
+        if let Ok(existing_ld_path) = std::env::var("LD_LIBRARY_PATH") {
+            cmd.env(
+                "LD_LIBRARY_PATH",
+                format!("{}:{}", lib_path.display(), existing_ld_path),
+            );
+        } else {
+            cmd.env("LD_LIBRARY_PATH", lib_path);
+        }
+    }
+
+    let err = cmd.exec();
 
     Err(zb_core::Error::ExecutionError {
         message: format!("failed to execute '{}': {}", formula, err),
     })
+}
+
+fn detect_runtime_prefix(bin_path: &Path) -> Option<PathBuf> {
+    let env_prefix = std::env::var("ZEROBREW_PREFIX").ok();
+    detect_runtime_prefix_with_env(bin_path, env_prefix.as_deref())
+}
+
+fn detect_runtime_prefix_with_env(bin_path: &Path, env_prefix: Option<&str>) -> Option<PathBuf> {
+    if let Some(prefix) = env_prefix {
+        return Some(PathBuf::from(prefix));
+    }
+
+    for ancestor in bin_path.ancestors() {
+        let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name == "Cellar" || name == "cellar" {
+            return ancestor.parent().map(Path::to_path_buf);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -82,12 +128,7 @@ mod tests {
     use tempfile::TempDir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use zb_io::api::ApiClient;
-    use zb_io::blob::BlobCache;
-    use zb_io::db::Database;
-    use zb_io::link::Linker;
-    use zb_io::materialize::Cellar;
-    use zb_io::store::Store;
+    use zb_io::{ApiClient, BlobCache, Cellar, Database, Linker, Store};
 
     fn create_bottle_tarball(formula_name: &str) -> Vec<u8> {
         use flate2::Compression;
@@ -127,6 +168,8 @@ mod tests {
     fn get_test_bottle_tag() -> &'static str {
         if cfg!(target_os = "linux") {
             "x86_64_linux"
+        } else if cfg!(target_arch = "x86_64") {
+            "sonoma"
         } else {
             "arm64_sonoma"
         }
@@ -304,5 +347,42 @@ mod tests {
 
         let result = prepare_execution(&mut installer, "nonexistent").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn ssl_cert_paths_use_prefix() {
+        let prefix = "/opt/test/prefix";
+        let ca_bundle = format!(
+            "{}/opt/ca-certificates/share/ca-certificates/cacert.pem",
+            prefix
+        );
+        let ca_dir = format!("{}/etc/ca-certificates", prefix);
+
+        assert_eq!(
+            ca_bundle,
+            "/opt/test/prefix/opt/ca-certificates/share/ca-certificates/cacert.pem"
+        );
+        assert_eq!(ca_dir, "/opt/test/prefix/etc/ca-certificates");
+    }
+
+    #[test]
+    fn detect_runtime_prefix_prefers_env_var() {
+        let bin_path = PathBuf::from("/tmp/prefix/Cellar/foo/1.0.0/bin/foo");
+        let detected = detect_runtime_prefix_with_env(&bin_path, Some("/env/prefix"));
+        assert_eq!(detected, Some(PathBuf::from("/env/prefix")));
+    }
+
+    #[test]
+    fn detect_runtime_prefix_from_cellar_path() {
+        let bin_path = PathBuf::from("/opt/zerobrew/prefix/Cellar/foo/1.0.0/bin/foo");
+        let detected = detect_runtime_prefix_with_env(&bin_path, None);
+        assert_eq!(detected, Some(PathBuf::from("/opt/zerobrew/prefix")));
+    }
+
+    #[test]
+    fn detect_runtime_prefix_from_lowercase_cellar_path() {
+        let bin_path = PathBuf::from("/opt/zerobrew/cellar/foo/1.0.0/bin/foo");
+        let detected = detect_runtime_prefix_with_env(&bin_path, None);
+        assert_eq!(detected, Some(PathBuf::from("/opt/zerobrew")));
     }
 }

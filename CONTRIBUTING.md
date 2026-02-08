@@ -44,7 +44,8 @@ out in the Discord to give us a heads up or open an issue first to discuss your 
 2. Make your changes and ensure, at the _least_:
    - Code is formatted: `cargo fmt --all`
    - No clippy warnings: `cargo clippy --workspace --all-targets -- -D warnings`
-   - Tests pass: `cargo test --workspace`
+   - Unit tests pass: `cargo test --workspace`
+   - Integration tests pass: `cargo test --workspace -- --ignored` (or `just test` for all tests)
 > [!NOTE] 
 > These will run in CI but it's best you clean up your code _before_ opening a PR to ensure a quick 
 > turnaround!
@@ -58,7 +59,7 @@ This project includes a `Justfile`, Install [just](https://github.com/casey/just
 - `just uninstall` Remove all zerobrew installations and configurations
 - `just fmt` Check code formatting
 - `just lint` Run clippy with strict warnings
-- `just test` Run all workspace tests
+- `just test` Run all workspace tests (unit & integration)
 
 Before creating a PR make sure you `build` your changes and `test` them.
 
@@ -105,13 +106,36 @@ are contained and cleanly seperated, properly describing/notating which commits 
 To benchmark performance:
 
 ```bash
-./benchmark.sh
+just bench --full
 ```
 
 This runs a 100-package installation suite comparing zerobrew to Homebrew. This is especially crucial to run if you are 
 planning on contributing to performance/optimization related changes.
 
+Useful options:
+
+```bash
+just bench --quick
+just bench --dry-run
+just bench --full results/
+just bench --format csv --output benchmark.csv
+just bench --log bench.log
+```
+
+Notes:
+- Defaults to the quick package list (22 packages); use `--full` for all 100.
+- `--full [dir]` writes all formats (txt/json/csv/html) to the directory.
+- `--output` infers format from file extension when `--format` is omitted.
+- Output includes cold + warm cache speedups per package.
+
+### macOS Homebrew permissions
+
+On macOS, Homebrew should be installed with a user-writable prefix. If `just bench` fails with a permission error, fix it by running:
+
+```bash
+sudo chown -R "$(whoami)" "$(brew --prefix)"
+```
+
 ## Questions?
 
 For further questions, open an issue on GitHub.
-

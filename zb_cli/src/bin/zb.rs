@@ -6,7 +6,7 @@ use zb_cli::{
     init::ensure_init,
     utils::get_root_path,
 };
-use zb_io::install::create_installer;
+use zb_io::create_installer;
 
 #[tokio::main]
 async fn main() {
@@ -26,18 +26,18 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
     let root = get_root_path(cli.root);
     let prefix = cli.prefix.unwrap_or_else(|| root.join("prefix"));
 
-    if matches!(cli.command, Commands::Init) {
-        return commands::init::execute(&root, &prefix);
+    if let Commands::Init { no_modify_path } = cli.command {
+        return commands::init::execute(&root, &prefix, no_modify_path);
     }
 
     if !matches!(cli.command, Commands::Reset { .. }) {
-        ensure_init(&root, &prefix)?;
+        ensure_init(&root, &prefix, cli.auto_init)?;
     }
 
     let mut installer = create_installer(&root, &prefix, cli.concurrency)?;
 
     match cli.command {
-        Commands::Init => unreachable!(),
+        Commands::Init { .. } => unreachable!(),
         Commands::Completion { .. } => unreachable!(),
         Commands::Install { formulas, no_link } => {
             commands::install::execute(&mut installer, formulas, no_link).await
@@ -45,7 +45,9 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         Commands::Bundle { file, no_link } => {
             commands::bundle::execute(&mut installer, &file, no_link).await
         }
-        Commands::Uninstall { formula } => commands::uninstall::execute(&mut installer, formula),
+        Commands::Uninstall { formulas, all } => {
+            commands::uninstall::execute(&mut installer, formulas, all)
+        }
         Commands::Migrate { yes, force } => {
             commands::migrate::execute(&mut installer, yes, force).await
         }

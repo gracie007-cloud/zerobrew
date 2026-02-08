@@ -15,8 +15,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 
-use crate::blob::BlobCache;
 use crate::progress::InstallProgress;
+use crate::storage::blob::BlobCache;
 use zb_core::Error;
 
 const RACING_CONNECTIONS: usize = 3;
@@ -127,20 +127,47 @@ struct CachedToken {
 
 type TokenCache = Arc<RwLock<HashMap<String, CachedToken>>>;
 
-fn build_rustls_config() -> rustls::ClientConfig {
+fn build_rustls_config() -> Option<rustls::ClientConfig> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
 
     let mut root_store = rustls::RootCertStore::empty();
 
-    for cert in rustls_native_certs::load_native_certs().expect("failed to load native certs") {
-        root_store.add(cert).ok();
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() {
+        let details = cert_result
+            .errors
+            .iter()
+            .take(3)
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        eprintln!(
+            "warning: failed to load {} native certificate(s): {}",
+            cert_result.errors.len(),
+            details
+        );
     }
 
-    rustls::ClientConfig::builder_with_provider(provider.into())
-        .with_safe_default_protocol_versions()
-        .expect("failed to set protocol versions")
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
+    for cert in cert_result.certs {
+        let _ = root_store.add(cert);
+    }
+
+    let builder = rustls::ClientConfig::builder_with_provider(provider.into());
+    let builder = match builder.with_safe_default_protocol_versions() {
+        Ok(builder) => builder,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to configure rustls protocol versions: {e}; falling back to reqwest default TLS"
+            );
+            return None;
+        }
+    };
+
+    Some(
+        builder
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
 }
 
 pub struct Downloader {
@@ -148,7 +175,7 @@ pub struct Downloader {
     blob_cache: BlobCache,
     token_cache: TokenCache,
     global_semaphore: Option<Arc<Semaphore>>,
-    tls_config: Arc<rustls::ClientConfig>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Downloader {
@@ -158,7 +185,7 @@ impl Downloader {
 
     pub fn with_semaphore(blob_cache: BlobCache, semaphore: Option<Arc<Semaphore>>) -> Self {
         // Use HTTP/2 with connection pooling for better performance
-        let tls_config = Arc::new(build_rustls_config());
+        let tls_config = build_rustls_config().map(Arc::new);
 
         Self {
             client: reqwest::Client::builder()
@@ -182,9 +209,12 @@ impl Downloader {
 
     // FIXME: extract timeout and HTTP/2 window size constants to config file
     fn create_isolated_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
-            .user_agent("zerobrew/0.1")
-            .use_preconfigured_tls(self.tls_config.clone())
+        let mut builder = reqwest::Client::builder().user_agent("zerobrew/0.1");
+        if let Some(tls_config) = &self.tls_config {
+            builder = builder.use_preconfigured_tls(tls_config.clone());
+        }
+
+        builder
             .pool_max_idle_per_host(0)
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
@@ -286,19 +316,33 @@ impl Downloader {
                 .clone()
                 .unwrap_or_else(|| Arc::new(Semaphore::new(GLOBAL_DOWNLOAD_CONCURRENCY)));
 
-            let ctx = ChunkedDownloadContext {
-                blob_cache: &self.blob_cache,
-                client: &self.client,
-                token_cache: &self.token_cache,
-                url: primary_url,
-                expected_sha256,
-                name,
-                progress,
-                file_size: size,
-                global_semaphore: &semaphore,
-            };
+            let mut all_urls = Vec::new();
+            all_urls.push(primary_url.to_string());
+            all_urls.extend(alternate_urls.iter().cloned());
 
-            return download_with_chunks(&ctx).await;
+            let mut last_error = None;
+            for url in &all_urls {
+                let ctx = ChunkedDownloadContext {
+                    blob_cache: &self.blob_cache,
+                    client: &self.client,
+                    token_cache: &self.token_cache,
+                    url: url.as_str(),
+                    expected_sha256,
+                    name: name.clone(),
+                    progress: progress.clone(),
+                    file_size: size,
+                    global_semaphore: &semaphore,
+                };
+
+                match download_with_chunks(&ctx).await {
+                    Ok(path) => return Ok(path),
+                    Err(err) => last_error = Some(err),
+                }
+            }
+
+            return Err(last_error.unwrap_or_else(|| Error::NetworkFailure {
+                message: "all chunked download attempts failed".to_string(),
+            }));
         }
 
         // Otherwise, use the existing racing logic
@@ -481,17 +525,50 @@ async fn fetch_download_response_internal(
     Ok(response)
 }
 
+async fn fetch_range_response_internal(
+    client: &reqwest::Client,
+    token_cache: &TokenCache,
+    url: &str,
+    range: &str,
+) -> Result<reqwest::Response, Error> {
+    let cached_token = get_cached_token_for_url_internal(token_cache, url).await;
+
+    let mut request = client.get(url).header("Range", range);
+    if let Some(token) = &cached_token {
+        request = request.header(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+    }
+
+    let response = request.send().await.map_err(|e| Error::NetworkFailure {
+        message: e.to_string(),
+    })?;
+
+    let response = if response.status() == StatusCode::UNAUTHORIZED {
+        handle_auth_challenge_internal(client, token_cache, url, response).await?
+    } else {
+        response
+    };
+
+    if !response.status().is_success() {
+        return Err(Error::NetworkFailure {
+            message: format!("HTTP {}", response.status()),
+        });
+    }
+
+    Ok(response)
+}
+
 async fn get_cached_token_for_url_internal(token_cache: &TokenCache, url: &str) -> Option<String> {
-    let scope_prefix = extract_scope_prefix(url)?;
+    let scope = extract_scope_for_url(url)?;
     let cache = token_cache.read().await;
     let now = Instant::now();
 
-    for (scope, cached) in cache.iter() {
-        if scope.starts_with(&scope_prefix) && cached.expires_at > now {
-            return Some(cached.token.clone());
-        }
-    }
-    None
+    cache
+        .get(&scope)
+        .filter(|cached| cached.expires_at > now)
+        .map(|cached| cached.token.clone())
 }
 
 async fn handle_auth_challenge_internal(
@@ -766,6 +843,19 @@ async fn download_chunk(
 
 /// Download a file using parallel chunk requests
 async fn download_with_chunks(ctx: &ChunkedDownloadContext<'_>) -> Result<PathBuf, Error> {
+    if !validate_range_support(ctx).await? {
+        let response =
+            fetch_download_response_internal(ctx.client, ctx.token_cache, ctx.url).await?;
+        return download_response_internal(
+            ctx.blob_cache,
+            response,
+            ctx.expected_sha256,
+            ctx.name.clone(),
+            ctx.progress.clone(),
+        )
+        .await;
+    }
+
     let chunks = calculate_chunk_ranges(ctx.file_size);
 
     if let (Some(cb), Some(n)) = (&ctx.progress, &ctx.name) {
@@ -937,6 +1027,23 @@ async fn download_with_chunks(ctx: &ChunkedDownloadContext<'_>) -> Result<PathBu
     writer.commit()
 }
 
+async fn validate_range_support(ctx: &ChunkedDownloadContext<'_>) -> Result<bool, Error> {
+    let response =
+        fetch_range_response_internal(ctx.client, ctx.token_cache, ctx.url, "bytes=0-0").await?;
+
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Ok(false);
+    }
+
+    let content_range = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    Ok(content_range.contains("0-0"))
+}
+
 async fn download_response_internal(
     blob_cache: &BlobCache,
     response: reqwest::Response,
@@ -1014,17 +1121,18 @@ async fn download_response_internal(
     writer.commit()
 }
 
-/// Extract scope prefix from a GHCR URL for token cache matching.
+/// Extract full scope from a GHCR URL for token cache matching.
 /// For URL like "https://ghcr.io/v2/homebrew/core/lz4/blobs/sha256:...",
-/// returns "repository:homebrew/core/" which matches scopes like "repository:homebrew/core/lz4:pull"
-fn extract_scope_prefix(url: &str) -> Option<String> {
-    if url.contains("ghcr.io/v2/homebrew/core/") {
-        // All homebrew/core packages use the same token server, but scopes are per-package
-        // We can't reuse tokens across packages, so return the full path prefix
-        Some("repository:homebrew/core/".to_string())
-    } else {
-        None
+/// returns "repository:homebrew/core/lz4:pull".
+fn extract_scope_for_url(url: &str) -> Option<String> {
+    let marker = "ghcr.io/v2/homebrew/core/";
+    let start = url.find(marker)? + marker.len();
+    let remainder = &url[start..];
+    let formula = remainder.split('/').next()?;
+    if formula.is_empty() {
+        return None;
     }
+    Some(format!("repository:homebrew/core/{formula}:pull"))
 }
 
 fn parse_www_authenticate(header: &str) -> Result<(String, String, String), Error> {
@@ -1267,6 +1375,11 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn build_rustls_config_does_not_panic() {
+        let _ = build_rustls_config();
+    }
+
     #[tokio::test]
     async fn valid_checksum_passes() {
         let mock_server = MockServer::start().await;
@@ -1399,8 +1512,8 @@ mod tests {
 
         let peak = max_concurrent.load(Ordering::SeqCst);
         assert!(
-            peak <= 2,
-            "peak concurrent downloads was {peak}, expected <= 2"
+            peak <= GLOBAL_DOWNLOAD_CONCURRENCY,
+            "peak concurrent downloads was {peak}, expected <= {GLOBAL_DOWNLOAD_CONCURRENCY}"
         );
     }
 
