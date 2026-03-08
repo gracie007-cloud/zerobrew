@@ -2,9 +2,10 @@ use console::style;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use zb_core::formula_token;
 use zb_io::Installer;
 
-use crate::utils::normalize_formula_name;
+use crate::utils::{normalize_formula_name, suggest_missing_formula_matches};
 
 /// Prepare a package for execution by ensuring it's installed
 /// Returns the path to the executable
@@ -34,14 +35,15 @@ pub async fn prepare_execution(
                 name: normalized.clone(),
             })?;
 
-    let keg_path = installer.keg_path(&normalized, &installed.version);
-    let bin_path = keg_path.join("bin").join(&normalized);
+    let executable_name = formula_token(&installed.name);
+    let keg_path = installer.keg_path(executable_name, &installed.version);
+    let bin_path = keg_path.join("bin").join(executable_name);
 
     if !bin_path.exists() {
         return Err(zb_core::Error::ExecutionError {
             message: format!(
                 "executable '{}' not found in package '{}'",
-                normalized, normalized
+                executable_name, normalized
             ),
         });
     }
@@ -60,7 +62,13 @@ pub async fn execute(
         style(&formula).bold()
     );
 
-    let bin_path = prepare_execution(installer, &formula).await?;
+    let bin_path = match prepare_execution(installer, &formula).await {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = suggest_missing_formula_matches(installer, &e).await;
+            return Err(e);
+        }
+    };
 
     println!(
         "{} Executing {}...",
@@ -221,14 +229,22 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client = ApiClient::with_base_url(mock_server.uri()).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         assert!(!installer.is_installed("testrun"));
 
@@ -291,14 +307,22 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client = ApiClient::with_base_url(mock_server.uri()).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         installer
             .install(&["alreadyinstalled".to_string()], false)
@@ -336,14 +360,22 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client = ApiClient::with_base_url(mock_server.uri()).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         let result = prepare_execution(&mut installer, "nonexistent").await;
         assert!(result.is_err());

@@ -112,7 +112,7 @@ fn build_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formula::{Bottle, BottleFile, BottleStable, Versions};
+    use crate::formula::types::{Bottle, BottleFile, BottleStable, KegOnly, Versions};
     use std::collections::BTreeMap;
 
     fn formula(name: &str, deps: &[&str]) -> Formula {
@@ -135,6 +135,15 @@ mod tests {
                 stable: BottleStable { files, rebuild: 0 },
             },
             revision: 0,
+            keg_only: KegOnly::default(),
+            keg_only_reason: None,
+            build_dependencies: Vec::new(),
+            urls: None,
+            ruby_source_path: None,
+            ruby_source_checksum: None,
+            uses_from_macos: Vec::new(),
+            requirements: Vec::new(),
+            variations: None,
         }
     }
 

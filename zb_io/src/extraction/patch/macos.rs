@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 use zb_core::Error;
 
 const HOMEBREW_PREFIXES: &[&str] = &[
@@ -8,10 +9,6 @@ const HOMEBREW_PREFIXES: &[&str] = &[
     "/usr/local",
     "/home/linuxbrew/.linuxbrew",
 ];
-
-/// Longest old prefix we patch:
-/// macOS Mach-O cannot be expanded in-place, so new prefix must not exceed this.
-const MAX_PREFIX_LEN_MACOS: usize = 13;
 
 /// Patch hardcoded Homebrew paths in text files.
 fn patch_text_file_strings(path: &Path, new_prefix: &str, new_cellar: &str) -> Result<(), Error> {
@@ -146,21 +143,11 @@ fn patch_macho_binary_strings(path: &Path, new_prefix: &str) -> Result<(), Error
         let new_bytes = new_prefix.as_bytes();
 
         if new_bytes.len() > old_bytes.len() {
-            if contents.windows(old_bytes.len()).any(|w| w == old_bytes) {
-                return Err(Error::StoreCorruption {
-                    message: format!(
-                        "zerobrew prefix \"{}\" ({} bytes) is longer than \"{}\" ({} bytes). \
-                         On macOS, Mach-O binaries cannot be expanded in-place, so path-sensitive formulae (e.g. git) will not work. \
-                         Use a prefix of at most {} characters, e.g. /opt/zerobrew. \
-                         Re-init with: zb init <root> /opt/zerobrew (or your chosen short prefix), then reinstall.",
-                        new_prefix,
-                        new_bytes.len(),
-                        *old_prefix,
-                        old_bytes.len(),
-                        MAX_PREFIX_LEN_MACOS
-                    ),
-                });
-            }
+            // Cannot expand shorter paths in-place in Mach-O binaries.
+            // Skip this prefix — the install_name_tool pass handles load
+            // command changes regardless of length, and many binaries
+            // legitimately reference shorter prefixes like /usr/local for
+            // system libraries (not Homebrew paths).
             continue;
         }
 
@@ -196,22 +183,28 @@ fn patch_macho_binary_strings(path: &Path, new_prefix: &str) -> Result<(), Error
             message: format!("failed to rename temp file: {e}"),
         })?;
 
+        // Restore original permissions — fs::File::create uses 0644 by default,
+        // which drops the execute bit from patched binaries.
+        fs::set_permissions(path, metadata.permissions()).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to restore permissions after patching: {e}"),
+        })?;
+
         match std::process::Command::new("codesign")
             .args(["--force", "--sign", "-", &path.to_string_lossy()])
             .output()
         {
             Ok(output) if !output.status.success() => {
-                eprintln!(
-                    "Warning: Failed to re-sign {}: {}",
-                    path.display(),
-                    String::from_utf8_lossy(&output.stderr)
+                warn!(
+                    path = %path.display(),
+                    error = %String::from_utf8_lossy(&output.stderr),
+                    "failed to re-sign patched file"
                 );
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: Failed to execute codesign for {}: {}",
-                    path.display(),
-                    e
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to execute codesign for patched file"
                 );
             }
             _ => {}
@@ -545,7 +538,38 @@ pub fn codesign_and_strip_xattrs(keg_path: &Path) -> Result<(), Error> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_patch_macho_preserves_execute_bit() {
+        let tmp = TempDir::new().unwrap();
+        let test_file = tmp.path().join("test_binary");
+
+        let old_prefix = "/home/linuxbrew/.linuxbrew";
+        let new_prefix = "/opt/zerobrew/prefix";
+
+        let mut contents = Vec::new();
+        contents.extend_from_slice(b"\xfe\xed\xfa\xcf");
+        contents.extend_from_slice(old_prefix.as_bytes());
+        contents.extend_from_slice(b"/bin/hello\0");
+
+        fs::write(&test_file, &contents).unwrap();
+
+        // Set executable permissions (0755)
+        let mut perms = fs::metadata(&test_file).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&test_file, perms).unwrap();
+
+        patch_macho_binary_strings(&test_file, new_prefix).unwrap();
+
+        let mode = fs::metadata(&test_file).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "execute bit lost after patching: mode = {:#o}",
+            mode
+        );
+    }
 
     #[test]
     fn test_patch_macho_binary_strings() {
@@ -578,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_macho_fails_when_new_prefix_longer() {
+    fn test_patch_macho_skips_when_new_prefix_longer() {
         let tmp = TempDir::new().unwrap();
         let test_file = tmp.path().join("test_binary");
 
@@ -595,23 +619,20 @@ mod tests {
         let original = contents.clone();
         fs::write(&test_file, &contents).unwrap();
 
+        // Should succeed (skip) rather than error when the new prefix is
+        // longer than the old one — install_name_tool handles load command
+        // changes regardless of length.
         let result = patch_macho_binary_strings(&test_file, new_prefix);
         assert!(
-            result.is_err(),
-            "should error when prefix too long and path present"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("13"),
-            "error should mention max prefix length"
-        );
-        assert!(
-            err_msg.contains("/opt/zerobrew"),
-            "error should suggest short prefix"
+            result.is_ok(),
+            "should skip when new prefix is longer than old prefix"
         );
 
         let unchanged = fs::read(&test_file).unwrap();
-        assert_eq!(unchanged, original, "binary must be unchanged");
+        assert_eq!(
+            unchanged, original,
+            "binary must be unchanged when prefix cannot be expanded in-place"
+        );
     }
 
     #[test]

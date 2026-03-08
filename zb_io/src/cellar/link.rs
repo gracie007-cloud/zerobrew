@@ -1,8 +1,22 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use zb_core::Error;
+use zb_core::{ConflictedLink, Error};
+
+const LINK_DIRS: &[&str] = &["bin", "lib", "libexec", "include", "share", "etc"];
+const LIBEXEC_SKIP_FILES: &[&str] = &[".gitignore", "pyvenv.cfg"];
+
+fn should_skip_link_entry(src_dir: &Path, entry_name: &std::ffi::OsStr) -> bool {
+    // Homebrew-style Python virtualenv formulae commonly place metadata files at
+    // libexec/.gitignore and libexec/pyvenv.cfg. Linking these into a shared
+    // prefix/libexec causes cross-formula conflicts (e.g. ranger vs ansible-lint)
+    // even though they are not executable entrypoints users need on PATH.
+    src_dir.file_name().and_then(|n| n.to_str()) == Some("libexec")
+        && entry_name
+            .to_str()
+            .is_some_and(|name| LIBEXEC_SKIP_FILES.contains(&name))
+}
 
 pub struct Linker {
     prefix: PathBuf,
@@ -16,6 +30,30 @@ pub struct LinkedFile {
     pub target_path: PathBuf,
 }
 
+fn keg_name_from_path(path: &Path) -> Option<String> {
+    let components: Vec<_> = path.components().collect();
+    for (i, c) in components.iter().enumerate() {
+        if let Component::Normal(s) = c
+            && s.eq_ignore_ascii_case("cellar")
+            && let Some(Component::Normal(name)) = components.get(i + 1)
+        {
+            return name.to_str().map(String::from);
+        }
+    }
+    None
+}
+
+fn keg_name_from_symlink(dst: &Path) -> Option<String> {
+    let target = fs::read_link(dst).ok()?;
+    let resolved = if target.is_relative() {
+        dst.parent().unwrap_or(Path::new("")).join(&target)
+    } else {
+        target
+    };
+    let canonical = fs::canonicalize(&resolved).ok()?;
+    keg_name_from_path(&canonical)
+}
+
 impl Linker {
     pub fn new(prefix: &Path) -> io::Result<Self> {
         let bin_dir = prefix.join("bin");
@@ -23,8 +61,10 @@ impl Linker {
         fs::create_dir_all(&bin_dir)?;
         fs::create_dir_all(&opt_dir)?;
 
-        for dir in ["lib", "libexec", "include", "share", "etc"] {
-            fs::create_dir_all(prefix.join(dir))?;
+        for dir in LINK_DIRS {
+            if *dir != "bin" {
+                fs::create_dir_all(prefix.join(dir))?;
+            }
         }
 
         Ok(Self {
@@ -34,10 +74,126 @@ impl Linker {
         })
     }
 
+    /// Pre-flight check: scan all destinations for conflicts without creating any symlinks.
+    /// Returns Ok(()) if no conflicts, or Err(LinkConflict) with all conflicts collected.
+    pub fn check_conflicts(&self, keg_path: &Path) -> Result<(), Error> {
+        let mut conflicts = Vec::new();
+        for dir_name in LINK_DIRS {
+            let src_dir = keg_path.join(dir_name);
+            let dst_dir = self.prefix.join(dir_name);
+            if src_dir.exists() {
+                Self::collect_conflicts(&src_dir, &dst_dir, &mut conflicts);
+            }
+        }
+        if conflicts.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::LinkConflict { conflicts })
+        }
+    }
+
+    fn collect_conflicts(src: &Path, dst: &Path, conflicts: &mut Vec<ConflictedLink>) {
+        let entries = match fs::read_dir(src) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if should_skip_link_entry(src, &file_name) {
+                continue;
+            }
+
+            let src_path = entry.path();
+            let dst_path = dst.join(&file_name);
+
+            // Use src_path.is_dir() which follows symlinks, so that keg entries
+            // like `man -> ../gnuman` (symlinks to directories) are treated as dirs.
+            if src_path.is_dir() {
+                // When the destination is a symlink to a directory, actual linking will
+                // expand it into individual file symlinks. Check the expanded contents.
+                if dst_path.symlink_metadata().is_ok()
+                    && dst_path.is_symlink()
+                    && let Ok(old_target) = fs::read_link(&dst_path)
+                {
+                    let resolved = if old_target.is_relative() {
+                        dst_path.parent().unwrap_or(Path::new("")).join(&old_target)
+                    } else {
+                        old_target
+                    };
+                    Self::collect_conflicts_merged(&src_path, &resolved, &dst_path, conflicts);
+                    continue;
+                }
+                Self::collect_conflicts(&src_path, &dst_path, conflicts);
+                continue;
+            }
+
+            if dst_path.symlink_metadata().is_ok() {
+                if let Ok(target) = fs::read_link(&dst_path) {
+                    let resolved = if target.is_relative() {
+                        dst_path.parent().unwrap_or(Path::new("")).join(&target)
+                    } else {
+                        target
+                    };
+                    if fs::canonicalize(&resolved).ok() == fs::canonicalize(&src_path).ok() {
+                        continue;
+                    }
+                }
+                conflicts.push(ConflictedLink {
+                    path: dst_path.clone(),
+                    owned_by: keg_name_from_symlink(&dst_path),
+                });
+            } else if dst_path.exists() {
+                conflicts.push(ConflictedLink {
+                    path: dst_path,
+                    owned_by: None,
+                });
+            }
+        }
+    }
+
+    /// Check for conflicts when a directory symlink will be expanded into file-level links.
+    /// `src` is the new keg's directory, `old_target` is where the existing symlink points,
+    /// and `dst` is the prefix directory that will be created.
+    fn collect_conflicts_merged(
+        src: &Path,
+        old_target: &Path,
+        dst: &Path,
+        conflicts: &mut Vec<ConflictedLink>,
+    ) {
+        let new_entries = match fs::read_dir(src) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in new_entries.flatten() {
+            let src_path = entry.path();
+            let matching_old = old_target.join(entry.file_name());
+            let dst_path = dst.join(entry.file_name());
+
+            if src_path.is_dir() {
+                if matching_old.exists() {
+                    Self::collect_conflicts_merged(&src_path, &matching_old, &dst_path, conflicts);
+                } else {
+                    Self::collect_conflicts(&src_path, &dst_path, conflicts);
+                }
+                continue;
+            }
+
+            if matching_old.exists()
+                && fs::canonicalize(&matching_old).ok() != fs::canonicalize(&src_path).ok()
+            {
+                conflicts.push(ConflictedLink {
+                    path: dst_path,
+                    owned_by: keg_name_from_symlink(dst).or_else(|| keg_name_from_path(old_target)),
+                });
+            }
+        }
+    }
+
     pub fn link_keg(&self, keg_path: &Path) -> Result<Vec<LinkedFile>, Error> {
+        self.check_conflicts(keg_path)?;
         self.link_opt(keg_path)?;
         let mut linked = Vec::new();
-        for dir_name in ["bin", "lib", "libexec", "include", "share", "etc"] {
+        for dir_name in LINK_DIRS {
             let src_dir = keg_path.join(dir_name);
             let dst_dir = self.prefix.join(dir_name);
             if src_dir.exists() {
@@ -61,13 +217,18 @@ impl Linker {
             let entry = entry.map_err(|e| Error::StoreCorruption {
                 message: e.to_string(),
             })?;
-            let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
-            let file_type = entry.file_type().map_err(|e| Error::StoreCorruption {
-                message: e.to_string(),
-            })?;
+            let file_name = entry.file_name();
+            if should_skip_link_entry(src, &file_name) {
+                continue;
+            }
 
-            if file_type.is_dir() {
+            let src_path = entry.path();
+            let dst_path = dst.join(&file_name);
+
+            // Use src_path.is_dir() which follows symlinks, so that keg entries
+            // like `man -> ../gnuman` (symlinks to directories) are expanded
+            // into individual file symlinks instead of conflicting.
+            if src_path.is_dir() {
                 if dst_path.symlink_metadata().is_ok() && dst_path.is_symlink() {
                     let old_target =
                         fs::read_link(&dst_path).map_err(|e| Error::StoreCorruption {
@@ -98,13 +259,28 @@ impl Linker {
                             let _ = fs::remove_file(&dst_path);
                         }
                     } else {
-                        return Err(Error::LinkConflict { path: dst_path });
+                        return Err(Error::LinkConflict {
+                            conflicts: vec![ConflictedLink {
+                                path: dst_path.clone(),
+                                owned_by: keg_name_from_symlink(&dst_path),
+                            }],
+                        });
                     }
                 } else {
-                    return Err(Error::LinkConflict { path: dst_path });
+                    return Err(Error::LinkConflict {
+                        conflicts: vec![ConflictedLink {
+                            path: dst_path,
+                            owned_by: None,
+                        }],
+                    });
                 }
             } else if dst_path.exists() {
-                return Err(Error::LinkConflict { path: dst_path });
+                return Err(Error::LinkConflict {
+                    conflicts: vec![ConflictedLink {
+                        path: dst_path,
+                        owned_by: None,
+                    }],
+                });
             }
 
             #[cfg(unix)]
@@ -124,7 +300,7 @@ impl Linker {
     pub fn unlink_keg(&self, keg_path: &Path) -> Result<Vec<PathBuf>, Error> {
         self.unlink_opt(keg_path)?;
         let mut unlinked = Vec::new();
-        for dir_name in ["bin", "lib", "libexec", "include", "share", "etc"] {
+        for dir_name in LINK_DIRS {
             let src_dir = keg_path.join(dir_name);
             let dst_dir = self.prefix.join(dir_name);
             if src_dir.exists() {
@@ -194,7 +370,7 @@ impl Linker {
         Ok(())
     }
 
-    fn link_opt(&self, keg_path: &Path) -> Result<(), Error> {
+    pub fn link_opt(&self, keg_path: &Path) -> Result<(), Error> {
         let name = keg_path
             .parent()
             .and_then(|p| p.file_name())
@@ -291,7 +467,6 @@ mod tests {
 
     #[test]
     fn links_libexec_directory() {
-        // Test that libexec directory is linked
         let tmp = TempDir::new().unwrap();
         let keg = tmp.path().join("cellar/git/2.52.0");
         let libexec_dir = keg.join("libexec/git-core");
@@ -304,9 +479,196 @@ mod tests {
         let linker = Linker::new(tmp.path()).unwrap();
         linker.link_keg(&keg).unwrap();
 
-        // Verify libexec is linked
         let linked_helper = tmp.path().join("libexec/git-core/git-remote-https");
         assert!(linked_helper.exists(), "git-remote-https should be linked");
         assert!(linked_helper.is_symlink(), "should be a symlink");
+    }
+
+    #[test]
+    fn skips_libexec_virtualenv_metadata_to_avoid_conflicts() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let keg1 = prefix.join("cellar/ranger/1.0.0");
+        fs::create_dir_all(keg1.join("libexec")).unwrap();
+        fs::create_dir_all(keg1.join("bin")).unwrap();
+        fs::write(keg1.join("libexec/.gitignore"), b"# ranger").unwrap();
+        fs::write(keg1.join("libexec/pyvenv.cfg"), b"home=/tmp/ranger").unwrap();
+        fs::write(keg1.join("bin/ranger"), b"#!/bin/sh\necho ranger").unwrap();
+        fs::set_permissions(keg1.join("bin/ranger"), PermissionsExt::from_mode(0o755)).unwrap();
+
+        let keg2 = prefix.join("cellar/ansible-lint/1.0.0");
+        fs::create_dir_all(keg2.join("libexec")).unwrap();
+        fs::create_dir_all(keg2.join("bin")).unwrap();
+        fs::write(keg2.join("libexec/.gitignore"), b"# ansible-lint").unwrap();
+        fs::write(keg2.join("libexec/pyvenv.cfg"), b"home=/tmp/ansible-lint").unwrap();
+        fs::write(
+            keg2.join("bin/ansible-lint"),
+            b"#!/bin/sh\necho ansible-lint",
+        )
+        .unwrap();
+        fs::set_permissions(
+            keg2.join("bin/ansible-lint"),
+            PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        linker.link_keg(&keg1).unwrap();
+        linker.link_keg(&keg2).unwrap();
+
+        // Metadata files should not be linked into shared prefix/libexec.
+        assert!(!prefix.join("libexec/.gitignore").exists());
+        assert!(!prefix.join("libexec/pyvenv.cfg").exists());
+
+        // Useful entrypoints still link correctly.
+        assert!(prefix.join("bin/ranger").exists());
+        assert!(prefix.join("bin/ansible-lint").exists());
+    }
+
+    #[test]
+    fn check_conflicts_passes_when_clean() {
+        let tmp = TempDir::new().unwrap();
+        let keg = setup_keg(&tmp, "foo");
+        let linker = Linker::new(tmp.path()).unwrap();
+        assert!(linker.check_conflicts(&keg).is_ok());
+    }
+
+    #[test]
+    fn check_conflicts_detects_conflicting_file() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let keg1 = setup_keg(&tmp, "pkg1");
+        linker.link_keg(&keg1).unwrap();
+
+        // Create a second keg with a conflicting binary name
+        let keg2 = prefix.join("cellar/pkg2/1.0.0");
+        let bin2 = keg2.join("bin");
+        fs::create_dir_all(&bin2).unwrap();
+        fs::write(bin2.join("pkg1"), b"conflict").unwrap();
+        fs::set_permissions(bin2.join("pkg1"), PermissionsExt::from_mode(0o755)).unwrap();
+
+        let result = linker.check_conflicts(&keg2);
+        assert!(result.is_err());
+        if let Err(Error::LinkConflict { conflicts }) = result {
+            assert_eq!(conflicts.len(), 1);
+            assert!(conflicts[0].path.ends_with("bin/pkg1"));
+            assert_eq!(conflicts[0].owned_by.as_deref(), Some("pkg1"));
+        }
+    }
+
+    #[test]
+    fn check_conflicts_collects_all_conflicts() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        // Create keg1 with two binaries
+        let keg1 = prefix.join("Cellar/pkg1/1.0.0");
+        let bin1 = keg1.join("bin");
+        fs::create_dir_all(&bin1).unwrap();
+        fs::write(bin1.join("tool-a"), b"a").unwrap();
+        fs::write(bin1.join("tool-b"), b"b").unwrap();
+        linker.link_keg(&keg1).unwrap();
+
+        // Create keg2 with overlapping binaries
+        let keg2 = prefix.join("Cellar/pkg2/1.0.0");
+        let bin2 = keg2.join("bin");
+        fs::create_dir_all(&bin2).unwrap();
+        fs::write(bin2.join("tool-a"), b"x").unwrap();
+        fs::write(bin2.join("tool-b"), b"y").unwrap();
+
+        let result = linker.check_conflicts(&keg2);
+        assert!(result.is_err());
+        if let Err(Error::LinkConflict { conflicts }) = result {
+            assert_eq!(conflicts.len(), 2);
+        }
+    }
+
+    #[test]
+    fn link_keg_rejects_conflicts_without_creating_links() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let keg1 = setup_keg(&tmp, "alpha");
+        linker.link_keg(&keg1).unwrap();
+
+        // keg2 has a binary named "alpha" that conflicts
+        let keg2 = prefix.join("cellar/beta/1.0.0");
+        let bin2 = keg2.join("bin");
+        fs::create_dir_all(&bin2).unwrap();
+        fs::write(bin2.join("alpha"), b"other").unwrap();
+        fs::write(bin2.join("beta-only"), b"unique").unwrap();
+
+        assert!(linker.link_keg(&keg2).is_err());
+        // The non-conflicting file should NOT have been linked (all-or-none)
+        assert!(!prefix.join("bin/beta-only").exists());
+        // The opt link should also not exist
+        assert!(!prefix.join("opt/beta").exists());
+    }
+
+    #[test]
+    fn symlink_to_directory_in_keg_expands_without_conflict() {
+        // Reproduces the gnu-sed / gnu-tar / findutils conflict from issue #69:
+        // https://github.com/lucasgelfond/zerobrew/issues/69
+        // each keg has `libexec/gnubin/man -> ../gnuman` (symlink to directory).
+        // The linker should expand these into individual file symlinks so that
+        // man pages from different kegs coexist.
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        // keg1: libexec/gnubin/man -> ../gnuman, with gnuman/man1/sed.1
+        let keg1 = prefix.join("Cellar/gnu-sed/4.9");
+        fs::create_dir_all(keg1.join("libexec/gnuman/man1")).unwrap();
+        fs::write(keg1.join("libexec/gnuman/man1/sed.1"), b"sed man").unwrap();
+        fs::create_dir_all(keg1.join("libexec/gnubin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../gnuman", keg1.join("libexec/gnubin/man")).unwrap();
+
+        // keg2: libexec/gnubin/man -> ../gnuman, with gnuman/man1/tar.1
+        let keg2 = prefix.join("Cellar/gnu-tar/1.35");
+        fs::create_dir_all(keg2.join("libexec/gnuman/man1")).unwrap();
+        fs::write(keg2.join("libexec/gnuman/man1/tar.1"), b"tar man").unwrap();
+        fs::create_dir_all(keg2.join("libexec/gnubin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../gnuman", keg2.join("libexec/gnubin/man")).unwrap();
+
+        // Both should link without conflicts
+        linker.link_keg(&keg1).unwrap();
+        linker.link_keg(&keg2).unwrap();
+
+        // Both man pages should be accessible
+        assert!(prefix.join("libexec/gnubin/man/man1/sed.1").exists());
+        assert!(prefix.join("libexec/gnubin/man/man1/tar.1").exists());
+        // gnuman dirs should also be expanded and merged
+        assert!(prefix.join("libexec/gnuman/man1/sed.1").exists());
+        assert!(prefix.join("libexec/gnuman/man1/tar.1").exists());
+    }
+
+    #[test]
+    fn check_conflicts_passes_for_symlink_to_directory() {
+        let tmp = TempDir::new().unwrap();
+        let prefix = tmp.path();
+        let linker = Linker::new(prefix).unwrap();
+
+        let keg1 = prefix.join("Cellar/pkg1/1.0.0");
+        fs::create_dir_all(keg1.join("libexec/realdir")).unwrap();
+        fs::write(keg1.join("libexec/realdir/file1"), b"a").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("realdir", keg1.join("libexec/alias")).unwrap();
+
+        let keg2 = prefix.join("Cellar/pkg2/1.0.0");
+        fs::create_dir_all(keg2.join("libexec/realdir")).unwrap();
+        fs::write(keg2.join("libexec/realdir/file2"), b"b").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("realdir", keg2.join("libexec/alias")).unwrap();
+
+        linker.link_keg(&keg1).unwrap();
+        // Pre-flight check should pass since the files don't overlap
+        assert!(linker.check_conflicts(&keg2).is_ok());
     }
 }

@@ -3,6 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::ui::{PromptDefault, StdUi};
+
 #[derive(Debug)]
 pub enum InitError {
     Message(String),
@@ -28,8 +30,41 @@ pub fn is_writable(path: &Path) -> bool {
     }
 }
 
-pub fn run_init(root: &Path, prefix: &Path, no_modify_path: bool) -> Result<(), InitError> {
-    println!("{} Initializing zerobrew...", style("==>").cyan().bold());
+/// Longest Homebrew prefix we may need to replace in Mach-O binaries.
+/// On macOS, paths inside Mach-O headers are fixed-size, so the replacement
+/// prefix must be no longer than the original.  `/opt/homebrew` = 13 chars.
+const MAX_PREFIX_LEN_MACOS: usize = 13;
+
+pub fn run_init(
+    root: &Path,
+    prefix: &Path,
+    no_modify_path: bool,
+    ui: &mut StdUi,
+) -> Result<(), InitError> {
+    // On macOS, warn early if the chosen prefix is too long for Mach-O patching.
+    if cfg!(target_os = "macos") {
+        let prefix_str = prefix.to_string_lossy();
+        if prefix_str.len() > MAX_PREFIX_LEN_MACOS {
+            ui.note(format!(
+                "Prefix \"{}\" ({} chars) exceeds the macOS Mach-O limit of {} characters.",
+                prefix_str,
+                prefix_str.len(),
+                MAX_PREFIX_LEN_MACOS,
+            ))
+            .map_err(io_to_init_error)?;
+            ui.info("Path-sensitive packages (e.g. git, curl) will fail to install.")
+                .map_err(io_to_init_error)?;
+            ui.info(format!(
+                "Consider a shorter prefix, e.g.: {}",
+                style("zb init <root> /opt/zerobrew").cyan(),
+            ))
+            .map_err(io_to_init_error)?;
+            ui.blank_line().map_err(io_to_init_error)?;
+        }
+    }
+
+    ui.heading("Initializing zerobrew...")
+        .map_err(io_to_init_error)?;
 
     let zerobrew_dir = match std::env::var("ZEROBREW_DIR") {
         Ok(dir) => dir,
@@ -63,10 +98,8 @@ pub fn run_init(root: &Path, prefix: &Path, no_modify_path: bool) -> Result<(), 
     });
 
     if need_sudo {
-        println!(
-            "{}",
-            style("    Creating directories (requires sudo)...").dim()
-        );
+        ui.info("Creating directories (requires sudo)...")
+            .map_err(io_to_init_error)?;
 
         for dir in &dirs_to_create {
             let status = Command::new("sudo")
@@ -120,11 +153,52 @@ pub fn run_init(root: &Path, prefix: &Path, no_modify_path: bool) -> Result<(), 
         }
     }
 
-    add_to_path(prefix, &zerobrew_dir, &zerobrew_bin, root, no_modify_path)?;
+    add_to_path(
+        prefix,
+        &zerobrew_dir,
+        &zerobrew_bin,
+        root,
+        no_modify_path,
+        ui,
+    )?;
 
-    println!("{} Initialization complete!", style("==>").cyan().bold());
+    ui.heading("Initialization complete!")
+        .map_err(io_to_init_error)?;
 
     Ok(())
+}
+
+const ZB_BLOCK_START: &str = "# >>> zerobrew >>>";
+const ZB_BLOCK_END: &str = "# <<< zerobrew <<<";
+
+fn upsert_managed_block(existing: &str, managed_block: &str) -> String {
+    if let Some(start_idx) = existing.find(ZB_BLOCK_START)
+        && let Some(end_rel_idx) = existing[start_idx..].find(ZB_BLOCK_END)
+    {
+        let mut end_idx = start_idx + end_rel_idx + ZB_BLOCK_END.len();
+        if existing[end_idx..].starts_with("\r\n") {
+            end_idx += 2;
+        } else if existing[end_idx..].starts_with('\n') {
+            end_idx += 1;
+        }
+        let mut out = String::with_capacity(existing.len() + managed_block.len());
+        out.push_str(&existing[..start_idx]);
+        out.push_str(managed_block);
+        out.push_str(&existing[end_idx..]);
+        return out;
+    }
+
+    if existing.trim().is_empty() {
+        managed_block.to_string()
+    } else {
+        let mut out = String::with_capacity(existing.len() + managed_block.len() + 1);
+        out.push_str(existing);
+        if !existing.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(managed_block);
+        out
+    }
 }
 
 fn add_to_path(
@@ -133,42 +207,52 @@ fn add_to_path(
     zerobrew_bin: &str,
     root: &Path,
     no_modify_path: bool,
+    ui: &mut StdUi,
 ) -> Result<(), InitError> {
+    enum ShellConfigKind {
+        Posix,
+        Fish,
+    }
+
     let shell = std::env::var("SHELL").unwrap_or_default();
     let home = std::env::var("HOME").map_err(|_| InitError::Message("HOME not set".to_string()))?;
 
-    let config_file = if shell.contains("zsh") {
+    let (config_file, shell_kind) = if shell.contains("zsh") {
         let zdotdir = std::env::var("ZDOTDIR").unwrap_or_else(|_| home.clone());
         let zshenv = format!("{}/.zshenv", zdotdir);
+        let zshrc = format!("{}/.zshrc", zdotdir);
+        let home_zshrc = format!("{}/.zshrc", home);
 
         if std::path::Path::new(&zshenv).exists() {
-            zshenv
+            (zshenv, ShellConfigKind::Posix)
+        } else if std::path::Path::new(&zshrc).exists() {
+            (zshrc, ShellConfigKind::Posix)
         } else {
-            format!("{}/.zshrc", zdotdir)
+            (home_zshrc, ShellConfigKind::Posix)
         }
     } else if shell.contains("bash") {
         let bash_profile = format!("{}/.bash_profile", home);
         if std::path::Path::new(&bash_profile).exists() {
-            bash_profile
+            (bash_profile, ShellConfigKind::Posix)
         } else {
-            format!("{}/.bashrc", home)
+            (format!("{}/.bashrc", home), ShellConfigKind::Posix)
         }
+    } else if shell.contains("fish") {
+        (
+            format!("{}/.config/fish/conf.d/zerobrew.fish", home),
+            ShellConfigKind::Fish,
+        )
     } else {
-        format!("{}/.profile", home)
+        (format!("{}/.profile", home), ShellConfigKind::Posix)
     };
 
     let prefix_bin = prefix.join("bin");
+    let existing_config = std::fs::read_to_string(&config_file).unwrap_or_default();
 
-    // Check if zerobrew is already configured
-    let already_added = if let Ok(contents) = std::fs::read_to_string(&config_file) {
-        contents.contains("# zerobrew")
-    } else {
-        false
-    };
-
-    if !no_modify_path && !already_added {
-        let config_content = format!(
-            r#"
+    if !no_modify_path {
+        let block_body = match shell_kind {
+            ShellConfigKind::Posix => format!(
+                r#"
 # zerobrew
 export ZEROBREW_DIR={zerobrew_dir}
 export ZEROBREW_BIN={zerobrew_bin}
@@ -177,21 +261,30 @@ export ZEROBREW_PREFIX={prefix}
 export PKG_CONFIG_PATH="$ZEROBREW_PREFIX/lib/pkgconfig:${{PKG_CONFIG_PATH:-}}"
 
 # SSL/TLS certificates (only if ca-certificates is installed)
-if [ -f "$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem" ]; then
-  export CURL_CA_BUNDLE="$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem"
-  export SSL_CERT_FILE="$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem"
-elif [ -f "$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem" ]; then
-  export CURL_CA_BUNDLE="$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem"
-  export SSL_CERT_FILE="$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem"
-elif [ -f "$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem" ]; then
-  export CURL_CA_BUNDLE="$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem"
-  export SSL_CERT_FILE="$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem"
+if [ -z "${{CURL_CA_BUNDLE:-}}" ] || [ -z "${{SSL_CERT_FILE:-}}" ]; then
+  if [ -f "$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem" ]; then
+    [ -z "${{CURL_CA_BUNDLE:-}}" ] && export CURL_CA_BUNDLE="$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem"
+    [ -z "${{SSL_CERT_FILE:-}}" ] && export SSL_CERT_FILE="$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem"
+  elif [ -f "$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem" ]; then
+    [ -z "${{CURL_CA_BUNDLE:-}}" ] && export CURL_CA_BUNDLE="$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem"
+    [ -z "${{SSL_CERT_FILE:-}}" ] && export SSL_CERT_FILE="$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem"
+  elif [ -f "$ZEROBREW_PREFIX/etc/openssl/cert.pem" ]; then
+    [ -z "${{CURL_CA_BUNDLE:-}}" ] && export CURL_CA_BUNDLE="$ZEROBREW_PREFIX/etc/openssl/cert.pem"
+    [ -z "${{SSL_CERT_FILE:-}}" ] && export SSL_CERT_FILE="$ZEROBREW_PREFIX/etc/openssl/cert.pem"
+  elif [ -f "$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem" ]; then
+    [ -z "${{CURL_CA_BUNDLE:-}}" ] && export CURL_CA_BUNDLE="$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem"
+    [ -z "${{SSL_CERT_FILE:-}}" ] && export SSL_CERT_FILE="$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem"
+  fi
 fi
 
-if [ -d "$ZEROBREW_PREFIX/etc/ca-certificates" ]; then
-  export SSL_CERT_DIR="$ZEROBREW_PREFIX/etc/ca-certificates"
-elif [ -d "$ZEROBREW_PREFIX/share/ca-certificates" ]; then
-  export SSL_CERT_DIR="$ZEROBREW_PREFIX/share/ca-certificates"
+if [ -z "${{SSL_CERT_DIR:-}}" ]; then
+  if [ -d "$ZEROBREW_PREFIX/etc/ca-certificates" ]; then
+    export SSL_CERT_DIR="$ZEROBREW_PREFIX/etc/ca-certificates"
+  elif [ -d "$ZEROBREW_PREFIX/etc/openssl/certs" ]; then
+    export SSL_CERT_DIR="$ZEROBREW_PREFIX/etc/openssl/certs"
+  elif [ -d "$ZEROBREW_PREFIX/share/ca-certificates" ]; then
+    export SSL_CERT_DIR="$ZEROBREW_PREFIX/share/ca-certificates"
+  fi
 fi
 
 # Helper function to safely append to PATH
@@ -206,61 +299,123 @@ _zb_path_append() {{
 _zb_path_append "$ZEROBREW_BIN"
 _zb_path_append "$ZEROBREW_PREFIX/bin"
 "#,
-            zerobrew_dir = zerobrew_dir,
-            zerobrew_bin = zerobrew_bin,
-            root = root.display(),
-            prefix = prefix.display()
-        );
+                zerobrew_dir = zerobrew_dir,
+                zerobrew_bin = zerobrew_bin,
+                root = root.display(),
+                prefix = prefix.display()
+            ),
+            ShellConfigKind::Fish => format!(
+                r#"
+# zerobrew
+set -gx ZEROBREW_DIR "{zerobrew_dir}"
+set -gx ZEROBREW_BIN "{zerobrew_bin}"
+set -gx ZEROBREW_ROOT "{root}"
+set -gx ZEROBREW_PREFIX "{prefix}"
+if set -q PKG_CONFIG_PATH
+    set -gx PKG_CONFIG_PATH "$ZEROBREW_PREFIX/lib/pkgconfig" $PKG_CONFIG_PATH
+else
+    set -gx PKG_CONFIG_PATH "$ZEROBREW_PREFIX/lib/pkgconfig"
+end
+
+# SSL/TLS certificates (only if ca-certificates is installed)
+if not set -q CURL_CA_BUNDLE; or not set -q SSL_CERT_FILE
+    if test -f "$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem"
+        set -q CURL_CA_BUNDLE; or set -gx CURL_CA_BUNDLE "$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem"
+        set -q SSL_CERT_FILE; or set -gx SSL_CERT_FILE "$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem"
+    else if test -f "$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem"
+        set -q CURL_CA_BUNDLE; or set -gx CURL_CA_BUNDLE "$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem"
+        set -q SSL_CERT_FILE; or set -gx SSL_CERT_FILE "$ZEROBREW_PREFIX/etc/ca-certificates/cacert.pem"
+    else if test -f "$ZEROBREW_PREFIX/etc/openssl/cert.pem"
+        set -q CURL_CA_BUNDLE; or set -gx CURL_CA_BUNDLE "$ZEROBREW_PREFIX/etc/openssl/cert.pem"
+        set -q SSL_CERT_FILE; or set -gx SSL_CERT_FILE "$ZEROBREW_PREFIX/etc/openssl/cert.pem"
+    else if test -f "$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem"
+        set -q CURL_CA_BUNDLE; or set -gx CURL_CA_BUNDLE "$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem"
+        set -q SSL_CERT_FILE; or set -gx SSL_CERT_FILE "$ZEROBREW_PREFIX/share/ca-certificates/cacert.pem"
+    end
+end
+
+if not set -q SSL_CERT_DIR
+    if test -d "$ZEROBREW_PREFIX/etc/ca-certificates"
+        set -gx SSL_CERT_DIR "$ZEROBREW_PREFIX/etc/ca-certificates"
+    else if test -d "$ZEROBREW_PREFIX/etc/openssl/certs"
+        set -gx SSL_CERT_DIR "$ZEROBREW_PREFIX/etc/openssl/certs"
+    else if test -d "$ZEROBREW_PREFIX/share/ca-certificates"
+        set -gx SSL_CERT_DIR "$ZEROBREW_PREFIX/share/ca-certificates"
+    end
+end
+
+if not contains -- "$ZEROBREW_BIN" $PATH
+    set -gx PATH "$ZEROBREW_BIN" $PATH
+end
+if not contains -- "$ZEROBREW_PREFIX/bin" $PATH
+    set -gx PATH "$ZEROBREW_PREFIX/bin" $PATH
+end
+"#,
+                zerobrew_dir = zerobrew_dir,
+                zerobrew_bin = zerobrew_bin,
+                root = root.display(),
+                prefix = prefix.display()
+            ),
+        };
+        let managed_block = format!("{ZB_BLOCK_START}{block_body}\n{ZB_BLOCK_END}\n");
+        let updated_config = upsert_managed_block(&existing_config, &managed_block);
+
+        if let Some(parent) = std::path::Path::new(&config_file).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                InitError::Message(format!(
+                    "Failed to create shell config directory {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
 
         let write_result = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&config_file)
-            .and_then(|mut f| f.write_all(config_content.as_bytes()));
+            .and_then(|mut f| f.write_all(updated_config.as_bytes()));
 
         if let Err(e) = write_result {
-            println!(
-                "{} Could not write to {} due to error: {}",
-                style("Warning:").yellow().bold(),
-                config_file,
-                e
-            );
-            println!(
-                "{} Please add the following to {}:",
-                style("Info:").cyan().bold(),
-                config_file
-            );
-            println!("{}", config_content);
+            ui.note(format!(
+                "Could not write to {} due to error: {}",
+                config_file, e
+            ))
+            .map_err(io_to_init_error)?;
+            ui.info(format!("Please add the following to {}:", config_file))
+                .map_err(io_to_init_error)?;
+            ui.info(&managed_block).map_err(io_to_init_error)?;
         } else {
-            println!(
-                "    {} Added zerobrew configuration to {}",
-                style("✓").green(),
-                config_file
-            );
-            println!(
-                "    {} Added {} and {} to PATH",
-                style("✓").green(),
+            ui.info(format!("Updated zerobrew configuration in {}", config_file))
+                .map_err(io_to_init_error)?;
+            ui.info(format!(
+                "Added {} and {} to PATH",
                 zerobrew_bin,
                 prefix_bin.display()
-            );
+            ))
+            .map_err(io_to_init_error)?;
         }
     } else if no_modify_path {
-        println!(
-            "    {} Skipped shell configuration (--no-modify-path)",
-            style("→").cyan()
-        );
-        println!(
-            "    {} To use zerobrew, add {} and {} to your PATH",
-            style("→").cyan(),
+        ui.info("Skipped shell configuration (--no-modify-path)")
+            .map_err(io_to_init_error)?;
+        ui.info(format!(
+            "To use zerobrew, add {} and {} to your PATH",
             zerobrew_bin,
             prefix_bin.display()
-        );
+        ))
+        .map_err(io_to_init_error)?;
     }
 
     Ok(())
 }
 
-pub fn ensure_init(root: &Path, prefix: &Path, auto_init: bool) -> Result<(), zb_core::Error> {
+pub fn ensure_init(
+    root: &Path,
+    prefix: &Path,
+    auto_init: bool,
+    ui: &mut StdUi,
+) -> Result<(), zb_core::Error> {
     if !needs_init(root, prefix) {
         return Ok(());
     }
@@ -272,25 +427,17 @@ pub fn ensure_init(root: &Path, prefix: &Path, auto_init: bool) -> Result<(), zb
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
 
     if is_interactive && !auto_init {
-        println!(
-            "{} Zerobrew needs to be initialized first.",
-            style("Note:").yellow().bold()
-        );
-        println!("    This will create directories at:");
-        println!("      • {}", root.display());
-        println!("      • {}", prefix.display());
-        println!();
+        ui.note("Zerobrew needs to be initialized first.")
+            .map_err(io_to_core_error)?;
+        ui.info("This will create directories at:")
+            .map_err(io_to_core_error)?;
+        ui.bullet(root.display()).map_err(io_to_core_error)?;
+        ui.bullet(prefix.display()).map_err(io_to_core_error)?;
+        ui.blank_line().map_err(io_to_core_error)?;
 
-        print!("Initialize now? [Y/n] ");
-        std::io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        let input = input.trim();
-
-        if !input.is_empty()
-            && !input.eq_ignore_ascii_case("y")
-            && !input.eq_ignore_ascii_case("yes")
+        if !ui
+            .prompt_yes_no("Initialize now? [Y/n]", PromptDefault::Yes)
+            .map_err(io_to_core_error)?
         {
             return Err(zb_core::Error::StoreCorruption {
                 message: "Initialization required. Run 'zb init' first.".to_string(),
@@ -305,15 +452,45 @@ pub fn ensure_init(root: &Path, prefix: &Path, auto_init: bool) -> Result<(), zb
     // Auto-initialize without prompting when non-interactive or auto_init is set
 
     // Pass false for no_modify_shell since user confirmed they want full initialization
-    run_init(root, prefix, false).map_err(|e| match e {
+    run_init(root, prefix, false, ui).map_err(|e| match e {
         InitError::Message(msg) => zb_core::Error::StoreCorruption { message: msg },
     })
+}
+
+fn io_to_init_error(err: std::io::Error) -> InitError {
+    InitError::Message(format!("Failed to write CLI output: {err}"))
+}
+
+fn io_to_core_error(err: std::io::Error) -> zb_core::Error {
+    zb_core::Error::StoreCorruption {
+        message: format!("failed to write CLI output: {err}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::Ui;
     use std::fs;
+    use std::path::Path;
+
+    fn add_to_path(
+        prefix: &Path,
+        zerobrew_dir: &str,
+        zerobrew_bin: &str,
+        root: &Path,
+        no_modify_path: bool,
+    ) -> Result<(), InitError> {
+        let mut ui = Ui::new();
+        super::add_to_path(
+            prefix,
+            zerobrew_dir,
+            zerobrew_bin,
+            root,
+            no_modify_path,
+            &mut ui,
+        )
+    }
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
@@ -394,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn add_to_path_writes_all_env_vars() {
+    fn add_to_path_writes_core_env_vars_with_guarded_ca_setup() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let prefix = tmp.path().join("prefix");
@@ -417,23 +594,25 @@ mod tests {
         add_to_path(&prefix, zerobrew_dir, zerobrew_bin, &root, false).unwrap();
 
         let content = fs::read_to_string(&shell_config).unwrap();
+        assert!(content.contains(ZB_BLOCK_START));
+        assert!(content.contains(ZB_BLOCK_END));
         assert!(content.contains("export ZEROBREW_DIR=/home/user/.zerobrew"));
         assert!(content.contains("export ZEROBREW_BIN=/home/user/.zerobrew/bin"));
         assert!(content.contains(&format!("export ZEROBREW_ROOT={}", root.display())));
         assert!(content.contains(&format!("export ZEROBREW_PREFIX={}", prefix.display())));
         assert!(content.contains("export PKG_CONFIG_PATH="));
         assert!(content.contains("/lib/pkgconfig"));
-        assert!(content.contains("if [ -f"));
+        assert!(
+            content.contains(
+                "if [ -z \"${CURL_CA_BUNDLE:-}\" ] || [ -z \"${SSL_CERT_FILE:-}\" ]; then"
+            )
+        );
+        assert!(content.contains("if [ -z \"${SSL_CERT_DIR:-}\" ]; then"));
         assert!(content.contains("CURL_CA_BUNDLE"));
         assert!(content.contains("SSL_CERT_FILE"));
         assert!(content.contains("SSL_CERT_DIR"));
-        assert!(content.contains("export CURL_CA_BUNDLE="));
-        assert!(content.contains("export SSL_CERT_FILE="));
-        assert!(content.contains("export SSL_CERT_DIR="));
-        assert!(
-            content
-                .contains("$ZEROBREW_PREFIX/opt/ca-certificates/share/ca-certificates/cacert.pem")
-        );
+        assert!(content.contains("$ZEROBREW_PREFIX/etc/openssl/cert.pem"));
+        assert!(content.contains("$ZEROBREW_PREFIX/etc/openssl/certs"));
     }
 
     #[test]
@@ -537,15 +716,24 @@ mod tests {
             std::env::set_var("SHELL", "/bin/bash");
         }
 
-        // Write initial config
-        fs::write(&shell_config, "# existing content\n# zerobrew\n").unwrap();
+        // Write initial config with existing managed block and unrelated user content
+        fs::write(
+            &shell_config,
+            format!(
+                "export KEEP_ME=true\n{ZB_BLOCK_START}\n# zerobrew\nexport ZEROBREW_DIR=/old\n{ZB_BLOCK_END}\n"
+            ),
+        )
+        .unwrap();
 
         add_to_path(&prefix, zerobrew_dir, zerobrew_bin, &root, false).unwrap();
 
-        // Content should remain unchanged since # zerobrew already exists
+        // Managed block should be replaced, preserving unrelated user content
         let content = fs::read_to_string(&shell_config).unwrap();
-        assert!(!content.contains("export ZEROBREW_DIR"));
-        assert_eq!(content, "# existing content\n# zerobrew\n");
+        assert!(content.contains("export KEEP_ME=true"));
+        assert!(content.contains("export ZEROBREW_DIR=/home/user/.zerobrew"));
+        assert!(!content.contains("export ZEROBREW_DIR=/old"));
+        assert_eq!(content.matches(ZB_BLOCK_START).count(), 1);
+        assert_eq!(content.matches(ZB_BLOCK_END).count(), 1);
     }
 
     #[test]
@@ -611,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn add_to_path_uses_bash_profile_when_exists() {
+    fn add_to_path_prefers_bash_profile_when_exists() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let prefix = tmp.path().join("prefix");
@@ -636,7 +824,6 @@ mod tests {
 
         add_to_path(&prefix, zerobrew_dir, zerobrew_bin, &root, false).unwrap();
 
-        // Should write to .bash_profile, not .bashrc
         assert!(bash_profile.exists());
         let profile_content = fs::read_to_string(&bash_profile).unwrap();
         assert!(profile_content.contains("# zerobrew"));
@@ -660,7 +847,7 @@ mod tests {
             std::env::set_var("HOME", home.to_str().unwrap());
         }
         unsafe {
-            std::env::set_var("SHELL", "/bin/fish");
+            std::env::set_var("SHELL", "/bin/sh");
         }
 
         add_to_path(&prefix, zerobrew_dir, zerobrew_bin, &root, false).unwrap();
@@ -684,6 +871,7 @@ mod tests {
         fs::create_dir(&zdotdir).unwrap();
         fs::create_dir(&prefix).unwrap();
         fs::create_dir(&root).unwrap();
+        fs::write(&shell_config, "# existing zshrc\n").unwrap();
 
         unsafe {
             std::env::set_var("HOME", home.to_str().unwrap());
@@ -697,9 +885,94 @@ mod tests {
 
         add_to_path(&prefix, zerobrew_dir, zerobrew_bin, &root, false).unwrap();
 
-        // Should write to $ZDOTDIR/.zshrc
+        // Should write to $ZDOTDIR/.zshrc when it exists
         assert!(shell_config.exists());
         let content = fs::read_to_string(&shell_config).unwrap();
         assert!(content.contains("# zerobrew"));
+    }
+
+    #[test]
+    fn add_to_path_uses_fish_conf_d_for_fish() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let prefix = tmp.path().join("prefix");
+        let root = tmp.path().join("root");
+        let fish_config = home.join(".config/fish/conf.d/zerobrew.fish");
+        let zerobrew_dir = "/home/user/.zerobrew";
+        let zerobrew_bin = "/home/user/.zerobrew/bin";
+
+        fs::create_dir(&prefix).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", home.to_str().unwrap());
+            std::env::set_var("SHELL", "/usr/bin/fish");
+        }
+
+        add_to_path(&prefix, zerobrew_dir, zerobrew_bin, &root, false).unwrap();
+
+        assert!(fish_config.exists());
+        let content = fs::read_to_string(&fish_config).unwrap();
+        assert!(content.contains("# zerobrew"));
+        assert!(content.contains("set -gx ZEROBREW_DIR"));
+        assert!(content.contains("if not set -q CURL_CA_BUNDLE; or not set -q SSL_CERT_FILE"));
+        assert!(content.contains("if not set -q SSL_CERT_DIR"));
+        assert!(content.contains("set -q CURL_CA_BUNDLE; or set -gx CURL_CA_BUNDLE"));
+        assert!(content.contains("set -q SSL_CERT_FILE; or set -gx SSL_CERT_FILE"));
+        assert!(content.contains("$ZEROBREW_PREFIX/etc/openssl/cert.pem"));
+        assert!(content.contains("$ZEROBREW_PREFIX/etc/openssl/certs"));
+        assert!(content.contains("if set -q PKG_CONFIG_PATH"));
+        assert!(content.contains(
+            "set -gx PKG_CONFIG_PATH \"$ZEROBREW_PREFIX/lib/pkgconfig\" $PKG_CONFIG_PATH"
+        ));
+        assert!(!content.contains(
+            "set -gx PKG_CONFIG_PATH \"$ZEROBREW_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH\""
+        ));
+    }
+
+    #[test]
+    fn add_to_path_falls_back_to_home_zshrc_when_zdotdir_files_missing() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let zdotdir = tmp.path().join("zsh_config");
+        let prefix = tmp.path().join("prefix");
+        let root = tmp.path().join("root");
+        let zdotdir_zshrc = zdotdir.join(".zshrc");
+        let home_zshrc = home.join(".zshrc");
+        let zerobrew_dir = "/home/user/.zerobrew";
+        let zerobrew_bin = "/home/user/.zerobrew/bin";
+
+        fs::create_dir(&zdotdir).unwrap();
+        fs::create_dir(&prefix).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", home.to_str().unwrap());
+            std::env::set_var("SHELL", "/bin/zsh");
+            std::env::set_var("ZDOTDIR", zdotdir.to_str().unwrap());
+        }
+
+        add_to_path(&prefix, zerobrew_dir, zerobrew_bin, &root, false).unwrap();
+
+        assert!(!zdotdir_zshrc.exists());
+        assert!(home_zshrc.exists());
+        let content = fs::read_to_string(&home_zshrc).unwrap();
+        assert!(content.contains("# zerobrew"));
+    }
+
+    #[test]
+    fn upsert_managed_block_replacement_consumes_trailing_newline() {
+        let managed_block =
+            format!("{ZB_BLOCK_START}\n# zerobrew\nexport ZEROBREW_DIR=/new\n{ZB_BLOCK_END}\n");
+        let existing = format!(
+            "prefix\n{ZB_BLOCK_START}\n# zerobrew\nexport ZEROBREW_DIR=/old\n{ZB_BLOCK_END}\npostfix\n"
+        );
+
+        let first = upsert_managed_block(&existing, &managed_block);
+        let second = upsert_managed_block(&first, &managed_block);
+
+        assert_eq!(first, second);
+        assert!(first.contains("# <<< zerobrew <<<\npostfix\n"));
+        assert!(!first.contains("# <<< zerobrew <<<\n\npostfix\n"));
     }
 }

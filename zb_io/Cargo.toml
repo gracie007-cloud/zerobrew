@@ -1,6 +1,6 @@
 [package]
 name = "zb_io"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 rust-version.workspace = true
 
@@ -23,6 +23,9 @@ fs4.workspace = true
 walkdir.workspace = true
 xz2.workspace = true
 zstd.workspace = true
+zip.workspace = true
+tracing.workspace = true
+strsim.workspace = true
 zb_core = { path = "../zb_core" }
 arwen = "0.0.5"
 object = "0.38.1"

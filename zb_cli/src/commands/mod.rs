@@ -6,6 +6,8 @@ pub mod init;
 pub mod install;
 pub mod list;
 pub mod migrate;
+pub mod outdated;
 pub mod reset;
 pub mod run;
 pub mod uninstall;
+pub mod update;

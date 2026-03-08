@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::cellar::link::Linker;
 use crate::cellar::materialize::Cellar;
+use crate::installer::cask::resolve_cask;
 use crate::network::api::ApiClient;
+use crate::network::cache::ApiCache;
 use crate::network::download::{
     DownloadProgressCallback, DownloadRequest, DownloadResult, ParallelDownloader,
 };
@@ -13,7 +17,10 @@ use crate::storage::blob::BlobCache;
 use crate::storage::db::Database;
 use crate::storage::store::Store;
 
-use zb_core::{Error, Formula, SelectedBottle, resolve_closure, select_bottle};
+use zb_core::{
+    BuildPlan, Error, Formula, InstallMethod, SelectedBottle, formula_token, resolve_closure,
+    select_bottle,
+};
 
 /// Maximum number of retries for corrupted downloads
 const MAX_CORRUPTION_RETRIES: usize = 3;
@@ -25,15 +32,38 @@ pub struct Installer {
     cellar: Cellar,
     linker: Linker,
     db: Database,
+    prefix: std::path::PathBuf,
 }
 
+#[derive(Debug)]
+pub struct PlannedInstall {
+    pub install_name: String,
+    pub formula: Formula,
+    pub method: InstallMethod,
+}
+
+#[derive(Debug)]
 pub struct InstallPlan {
-    pub formulas: Vec<Formula>,
-    pub bottles: Vec<SelectedBottle>,
+    pub items: Vec<PlannedInstall>,
 }
 
 pub struct ExecuteResult {
     pub installed: usize,
+}
+
+/// A package that has a newer version available upstream.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutdatedPackage {
+    pub name: String,
+    pub installed_version: String,
+    pub current_version: String,
+    #[serde(skip)]
+    pub installed_sha256: String,
+    #[serde(skip)]
+    pub current_sha256: String,
+    /// Whether this was installed from source (vs bottle)
+    #[serde(skip)]
+    pub is_source_build: bool,
 }
 
 impl Installer {
@@ -44,6 +74,7 @@ impl Installer {
         cellar: Cellar,
         linker: Linker,
         db: Database,
+        prefix: std::path::PathBuf,
     ) -> Self {
         Self {
             api_client,
@@ -52,34 +83,191 @@ impl Installer {
             cellar,
             linker,
             db,
+            prefix,
         }
     }
 
-    /// Resolve dependencies and plan the install
-    pub async fn plan(&self, names: &[String]) -> Result<InstallPlan, Error> {
-        // Recursively fetch all formulas we need
-        let formulas = self.fetch_all_formulas(names).await?;
+    /// Clear the API cache, forcing fresh metadata on next operation.
+    pub fn clear_api_cache(&self) -> Result<usize, Error> {
+        self.api_client.clear_cache()
+    }
 
-        // Resolve in topological order
-        let ordered = resolve_closure(names, &formulas)?;
+    /// Check if a specific installed package is outdated.
+    /// Returns Ok(None) if up-to-date, Ok(Some(..)) if outdated.
+    pub async fn is_outdated(&self, name: &str) -> Result<Option<OutdatedPackage>, Error> {
+        let installed = self.db.get_installed(name).ok_or(Error::NotInstalled {
+            name: name.to_string(),
+        })?;
 
-        // Build list of formulas in order
-        let all_formulas: Vec<Formula> = ordered
-            .iter()
-            .map(|n| formulas.get(n).cloned().unwrap())
-            .collect();
+        let formula = self.api_client.get_formula(name).await?;
+        let is_source = installed.store_key.starts_with("source:");
 
-        // Select bottles for each formula
-        let mut bottles = Vec::new();
-        for formula in &all_formulas {
-            let bottle = select_bottle(formula)?;
-            bottles.push(bottle);
+        if is_source {
+            let current_version = formula.effective_version();
+            if installed.version == current_version {
+                Ok(None)
+            } else {
+                Ok(Some(OutdatedPackage {
+                    name: name.to_string(),
+                    installed_version: installed.version,
+                    installed_sha256: installed.store_key,
+                    current_version,
+                    current_sha256: String::new(),
+                    is_source_build: true,
+                }))
+            }
+        } else {
+            let bottle = select_bottle(&formula)?;
+            if installed.store_key == bottle.sha256 {
+                Ok(None)
+            } else {
+                Ok(Some(OutdatedPackage {
+                    name: name.to_string(),
+                    installed_version: installed.version,
+                    installed_sha256: installed.store_key,
+                    current_version: formula.effective_version(),
+                    current_sha256: bottle.sha256,
+                    is_source_build: false,
+                }))
+            }
+        }
+    }
+
+    pub async fn check_outdated(&self) -> Result<(Vec<OutdatedPackage>, Vec<String>), Error> {
+        use std::collections::HashMap;
+
+        let installed = self.db.list_installed()?;
+        if installed.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
         }
 
-        Ok(InstallPlan {
-            formulas: all_formulas,
-            bottles,
-        })
+        let installed_names: std::collections::HashSet<&str> =
+            installed.iter().map(|k| k.name.as_str()).collect();
+
+        let bulk_raw = self.api_client.get_all_formulas_raw().await?;
+        let bulk_values: Vec<serde_json::Value> =
+            serde_json::from_str(&bulk_raw).map_err(|e| Error::NetworkFailure {
+                message: format!("failed to parse bulk formula JSON: {e}"),
+            })?;
+
+        let mut bulk_map: HashMap<String, Formula> = HashMap::new();
+        for val in bulk_values {
+            let name = match val.get("name").and_then(|n| n.as_str()) {
+                Some(n) if installed_names.contains(n) => n.to_string(),
+                _ => continue,
+            };
+            if let Ok(f) = serde_json::from_value(val) {
+                bulk_map.insert(name, f);
+            }
+        }
+
+        let mut outdated = Vec::new();
+        let mut warnings = Vec::new();
+
+        for keg in &installed {
+            let is_tap = keg.name.contains('/');
+
+            let formula = if is_tap || !bulk_map.contains_key(&keg.name) {
+                match self.api_client.get_formula(&keg.name).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warnings.push(format!("{}: {}", keg.name, e));
+                        continue;
+                    }
+                }
+            } else {
+                bulk_map.remove(&keg.name).unwrap()
+            };
+
+            let is_source = keg.store_key.starts_with("source:");
+
+            if is_source {
+                let current_version = formula.effective_version();
+                if keg.version != current_version {
+                    outdated.push(OutdatedPackage {
+                        name: keg.name.clone(),
+                        installed_version: keg.version.clone(),
+                        installed_sha256: keg.store_key.clone(),
+                        current_version,
+                        current_sha256: String::new(),
+                        is_source_build: true,
+                    });
+                }
+            } else {
+                match select_bottle(&formula) {
+                    Ok(bottle) => {
+                        if keg.store_key != bottle.sha256 {
+                            outdated.push(OutdatedPackage {
+                                name: keg.name.clone(),
+                                installed_version: keg.version.clone(),
+                                installed_sha256: keg.store_key.clone(),
+                                current_version: formula.effective_version(),
+                                current_sha256: bottle.sha256,
+                                is_source_build: false,
+                            });
+                        }
+                    }
+                    Err(e) => warnings.push(format!("{}: {}", keg.name, e)),
+                }
+            }
+        }
+
+        outdated.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok((outdated, warnings))
+    }
+
+    pub async fn suggest_formulas(&self, query: &str, limit: usize) -> Result<Vec<String>, Error> {
+        self.api_client.suggest_formulas(query, limit).await
+    }
+
+    pub async fn plan(&self, names: &[String]) -> Result<InstallPlan, Error> {
+        self.plan_with_options(names, false).await
+    }
+
+    pub async fn plan_with_options(
+        &self,
+        names: &[String],
+        build_from_source: bool,
+    ) -> Result<InstallPlan, Error> {
+        let formulas = self.fetch_all_formulas(names).await?;
+        let ordered = resolve_closure(names, &formulas)?;
+
+        let mut items = Vec::with_capacity(ordered.len());
+        for install_name in ordered {
+            let formula = formulas.get(&install_name).cloned().unwrap();
+            let method = if build_from_source {
+                match BuildPlan::from_formula(&formula, &self.prefix) {
+                    Some(plan) => InstallMethod::Source(plan),
+                    None => match select_bottle(&formula) {
+                        Ok(bottle) => InstallMethod::Bottle(bottle),
+                        Err(_) => {
+                            return Err(Error::UnsupportedBottle {
+                                name: formula.name.clone(),
+                            });
+                        }
+                    },
+                }
+            } else {
+                match select_bottle(&formula) {
+                    Ok(bottle) => InstallMethod::Bottle(bottle),
+                    Err(_) => match BuildPlan::from_formula(&formula, &self.prefix) {
+                        Some(plan) => InstallMethod::Source(plan),
+                        None => {
+                            return Err(Error::UnsupportedBottle {
+                                name: formula.name.clone(),
+                            });
+                        }
+                    },
+                }
+            };
+            items.push(PlannedInstall {
+                install_name,
+                formula,
+                method,
+            });
+        }
+
+        Ok(InstallPlan { items })
     }
 
     /// Try to extract a download, with automatic retry on corruption
@@ -102,11 +290,11 @@ impl Installer {
 
                     if attempt + 1 < MAX_CORRUPTION_RETRIES {
                         // Log retry attempt
-                        eprintln!(
-                            "    Corrupted download detected for {}, retrying ({}/{})...",
-                            formula.name,
-                            attempt + 2,
-                            MAX_CORRUPTION_RETRIES
+                        warn!(
+                            formula = %formula.name,
+                            attempt = attempt + 2,
+                            max_retries = MAX_CORRUPTION_RETRIES,
+                            "corrupted download detected; retrying"
                         );
 
                         // Re-download
@@ -193,12 +381,10 @@ impl Installer {
                     Err(e) => return Err(e),
                 };
 
-                // Check if this formula has a bottle for the current platform
-                // If not, skip it (it's likely a system-provided dependency on this platform)
-                if select_bottle(&formula).is_err() {
-                    eprintln!(
-                        "    Skipping {} (no bottle available for this platform)",
-                        formula.name
+                if select_bottle(&formula).is_err() && !formula.has_source_url() {
+                    warn!(
+                        formula = %formula.name,
+                        "skipping formula with no bottle or source available for this platform"
                     );
                     continue;
                 }
@@ -222,8 +408,6 @@ impl Installer {
         self.execute_with_progress(plan, link, None).await
     }
 
-    /// Execute the install plan with progress callback
-    /// Uses streaming extraction - starts extracting each package as soon as its download completes
     pub async fn execute_with_progress(
         &mut self,
         plan: InstallPlan,
@@ -236,206 +420,231 @@ impl Installer {
             }
         };
 
-        // Pair formulas with bottles
-        let to_install: Vec<(Formula, SelectedBottle)> = plan
-            .formulas
+        let (bottle_items, source_items): (Vec<_>, Vec<_>) = plan
+            .items
             .into_iter()
-            .zip(plan.bottles.into_iter())
-            .collect();
+            .partition(|item| matches!(item.method, InstallMethod::Bottle(_)));
 
-        if to_install.is_empty() {
+        if bottle_items.is_empty() && source_items.is_empty() {
             return Ok(ExecuteResult { installed: 0 });
         }
-
-        // Download all bottles
-        let requests: Vec<DownloadRequest> = to_install
-            .iter()
-            .map(|(f, b)| DownloadRequest {
-                url: b.url.clone(),
-                sha256: b.sha256.clone(),
-                name: f.name.clone(),
-            })
-            .collect();
-
-        // Convert progress callback for download
-        let download_progress: Option<DownloadProgressCallback> = progress.clone().map(|cb| {
-            Arc::new(move |event: InstallProgress| {
-                cb(event);
-            }) as DownloadProgressCallback
-        });
-
-        // Use streaming downloads - process each as it completes
-        let mut rx = self
-            .downloader
-            .download_streaming(requests, download_progress.clone());
 
         let mut installed = 0usize;
         let mut error: Option<Error> = None;
 
-        // Process downloads as they complete
-        while let Some(result) = rx.recv().await {
-            match result {
-                Ok(download) => {
-                    let idx = download.index;
-                    let (formula, bottle) = &to_install[idx];
-                    let processed_name = formula.name.clone();
-                    let processed_version = formula.effective_version();
-                    let processed_store_key = bottle.sha256.clone();
-
-                    report(InstallProgress::UnpackStarted {
-                        name: processed_name.clone(),
-                    });
-
-                    // Try extraction with retry logic for corrupted downloads
-                    let store_entry = match self
-                        .extract_with_retry(&download, formula, bottle, download_progress.clone())
-                        .await
-                    {
-                        Ok(entry) => entry,
-                        Err(e) => {
-                            error = Some(e);
-                            continue;
-                        }
+        if !bottle_items.is_empty() {
+            let requests: Vec<DownloadRequest> = bottle_items
+                .iter()
+                .map(|item| {
+                    let InstallMethod::Bottle(ref bottle) = item.method else {
+                        unreachable!()
                     };
+                    DownloadRequest {
+                        url: bottle.url.clone(),
+                        sha256: bottle.sha256.clone(),
+                        name: item.formula.name.clone(),
+                    }
+                })
+                .collect();
 
-                    // Materialize to cellar
-                    // Use effective_version() which includes rebuild suffix if applicable
-                    let keg_path = match self.cellar.materialize(
-                        &processed_name,
-                        &processed_version,
-                        &store_entry,
-                    ) {
-                        Ok(path) => path,
-                        Err(e) => {
-                            error = Some(e);
-                            continue;
-                        }
-                    };
+            let download_progress: Option<DownloadProgressCallback> = progress.clone().map(|cb| {
+                Arc::new(move |event: InstallProgress| {
+                    cb(event);
+                }) as DownloadProgressCallback
+            });
 
-                    report(InstallProgress::UnpackCompleted {
-                        name: processed_name.clone(),
-                    });
+            let mut rx = self
+                .downloader
+                .download_streaming(requests, download_progress.clone());
 
-                    // Link executables if requested
-                    let linked_files = if link {
-                        report(InstallProgress::LinkStarted {
-                            name: processed_name.clone(),
+            while let Some(result) = rx.recv().await {
+                match result {
+                    Ok(download) => {
+                        let idx = download.index;
+                        let item = &bottle_items[idx];
+                        let InstallMethod::Bottle(ref bottle) = item.method else {
+                            unreachable!()
+                        };
+                        let processed_name = item.install_name.clone();
+                        let materialized_name = item.formula.name.clone();
+                        let processed_version = item.formula.effective_version();
+                        let processed_store_key = bottle.sha256.clone();
+
+                        report(InstallProgress::UnpackStarted {
+                            name: materialized_name.clone(),
                         });
-                        match self.linker.link_keg(&keg_path) {
-                            Ok(files) => {
-                                report(InstallProgress::LinkCompleted {
-                                    name: processed_name.clone(),
-                                });
-                                files
-                            }
+
+                        let store_entry = match self
+                            .extract_with_retry(
+                                &download,
+                                &item.formula,
+                                bottle,
+                                download_progress.clone(),
+                            )
+                            .await
+                        {
+                            Ok(entry) => entry,
                             Err(e) => {
-                                Self::cleanup_failed_install(
-                                    &self.linker,
+                                error = Some(e);
+                                continue;
+                            }
+                        };
+
+                        let keg_path = match self.cellar.materialize(
+                            &materialized_name,
+                            &processed_version,
+                            &store_entry,
+                        ) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                error = Some(e);
+                                continue;
+                            }
+                        };
+
+                        report(InstallProgress::UnpackCompleted {
+                            name: materialized_name.clone(),
+                        });
+
+                        let tx = match self.db.transaction() {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                Self::cleanup_materialized(
                                     &self.cellar,
-                                    &processed_name,
+                                    &materialized_name,
                                     &processed_version,
-                                    &keg_path,
-                                    true,
                                 );
                                 error = Some(e);
                                 continue;
                             }
-                        }
-                    } else {
-                        Vec::new()
-                    };
+                        };
 
-                    // Report installation completed for this package
-                    report(InstallProgress::InstallCompleted {
-                        name: processed_name.clone(),
-                    });
-
-                    let processed_links = linked_files;
-
-                    // Persist successful package immediately so one later failure
-                    // does not erase already completed work from DB metadata.
-                    let tx_result = self.db.transaction();
-                    let tx = match tx_result {
-                        Ok(tx) => tx,
-                        Err(e) => {
-                            Self::cleanup_failed_install(
-                                &self.linker,
+                        if let Err(e) = tx.record_install(
+                            &processed_name,
+                            &processed_version,
+                            &processed_store_key,
+                        ) {
+                            drop(tx);
+                            Self::cleanup_materialized(
                                 &self.cellar,
-                                &processed_name,
+                                &materialized_name,
                                 &processed_version,
-                                &keg_path,
-                                link,
                             );
                             error = Some(e);
                             continue;
                         }
-                    };
 
-                    if let Err(e) =
-                        tx.record_install(&processed_name, &processed_version, &processed_store_key)
-                    {
-                        drop(tx);
-                        Self::cleanup_failed_install(
-                            &self.linker,
-                            &self.cellar,
-                            &processed_name,
-                            &processed_version,
-                            &keg_path,
-                            link,
-                        );
-                        error = Some(e);
-                        continue;
-                    }
-
-                    let mut link_error = None;
-                    for linked in &processed_links {
-                        if let Err(e) = tx.record_linked_file(
-                            &processed_name,
-                            &processed_version,
-                            &linked.link_path.to_string_lossy(),
-                            &linked.target_path.to_string_lossy(),
-                        ) {
-                            link_error = Some(e);
-                            break;
+                        if let Err(e) = tx.commit() {
+                            Self::cleanup_materialized(
+                                &self.cellar,
+                                &materialized_name,
+                                &processed_version,
+                            );
+                            error = Some(e);
+                            continue;
                         }
-                    }
 
-                    if let Some(e) = link_error {
-                        drop(tx);
-                        Self::cleanup_failed_install(
-                            &self.linker,
-                            &self.cellar,
-                            &processed_name,
-                            &processed_version,
-                            &keg_path,
-                            link,
-                        );
+                        if let Err(e) = self.linker.link_opt(&keg_path) {
+                            warn!(formula = %processed_name, error = %e, "failed to create opt link");
+                        }
+
+                        let should_link = link && !item.formula.is_keg_only();
+
+                        let linked_files = if should_link {
+                            report(InstallProgress::LinkStarted {
+                                name: materialized_name.clone(),
+                            });
+                            match self.linker.link_keg(&keg_path) {
+                                Ok(files) => {
+                                    report(InstallProgress::LinkCompleted {
+                                        name: materialized_name.clone(),
+                                    });
+                                    files
+                                }
+                                Err(e) => {
+                                    let _ = self.linker.unlink_keg(&keg_path);
+                                    error = Some(e);
+                                    installed += 1;
+                                    report(InstallProgress::InstallCompleted {
+                                        name: materialized_name.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        } else {
+                            if link && item.formula.is_keg_only() {
+                                let reason = match &item.formula.keg_only {
+                                    zb_core::KegOnly::Reason(s) => s.clone(),
+                                    _ if item.formula.name.contains('@') => {
+                                        "versioned formula".to_string()
+                                    }
+                                    _ => "keg-only formula".to_string(),
+                                };
+                                report(InstallProgress::LinkSkipped {
+                                    name: materialized_name.clone(),
+                                    reason,
+                                });
+                            }
+                            Vec::new()
+                        };
+
+                        if !linked_files.is_empty()
+                            && let Ok(tx) = self.db.transaction()
+                        {
+                            let mut ok = true;
+                            for linked in &linked_files {
+                                if tx
+                                    .record_linked_file(
+                                        &processed_name,
+                                        &processed_version,
+                                        &linked.link_path.to_string_lossy(),
+                                        &linked.target_path.to_string_lossy(),
+                                    )
+                                    .is_err()
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                let _ = tx.commit();
+                            }
+                        }
+
+                        report(InstallProgress::InstallCompleted {
+                            name: materialized_name.clone(),
+                        });
+
+                        installed += 1;
+                    }
+                    Err(e) => {
                         error = Some(e);
-                        continue;
                     }
-
-                    if let Err(e) = tx.commit() {
-                        Self::cleanup_failed_install(
-                            &self.linker,
-                            &self.cellar,
-                            &processed_name,
-                            &processed_version,
-                            &keg_path,
-                            link,
-                        );
-                        error = Some(e);
-                        continue;
-                    }
-
-                    installed += 1;
-                }
-                Err(e) => {
-                    error = Some(e);
                 }
             }
         }
 
-        // Return error if any download failed
+        for item in &source_items {
+            let InstallMethod::Source(ref build_plan) = item.method else {
+                unreachable!()
+            };
+
+            report(InstallProgress::UnpackStarted {
+                name: item.formula.name.clone(),
+            });
+
+            match self
+                .install_from_source(item, build_plan, link, &report)
+                .await
+            {
+                Ok(()) => installed += 1,
+                Err(e) => {
+                    error = Some(e);
+                    continue;
+                }
+            }
+        }
+
         if let Some(e) = error {
             return Err(e);
         }
@@ -452,24 +661,305 @@ impl Installer {
         unlink: bool,
     ) {
         if unlink && let Err(e) = linker.unlink_keg(keg_path) {
-            eprintln!(
-                "warning: failed to clean up links for {}@{} after install error: {}",
-                name, version, e
+            warn!(
+                formula = %name,
+                version = %version,
+                error = %e,
+                "failed to clean up links after install error"
             );
         }
 
         if let Err(e) = cellar.remove_keg(name, version) {
-            eprintln!(
-                "warning: failed to remove keg for {}@{} after install error: {}",
-                name, version, e
+            warn!(
+                formula = %name,
+                version = %version,
+                error = %e,
+                "failed to remove keg after install error"
+            );
+        }
+    }
+
+    async fn install_from_source(
+        &mut self,
+        item: &PlannedInstall,
+        build_plan: &BuildPlan,
+        link: bool,
+        report: &impl Fn(InstallProgress),
+    ) -> Result<(), Error> {
+        let install_name = &item.install_name;
+        let formula_name = &item.formula.name;
+        let version = item.formula.effective_version();
+
+        let ruby_source_path =
+            item.formula
+                .ruby_source_path
+                .as_deref()
+                .ok_or_else(|| Error::ExecutionError {
+                    message: format!("no ruby_source_path for formula '{formula_name}'"),
+                })?;
+
+        let cache_dir = self.prefix.join("tmp").join("rb_cache");
+        let formula_rb_checksum = item
+            .formula
+            .ruby_source_checksum
+            .as_ref()
+            .map(|checksum| checksum.sha256.as_str());
+
+        let formula_rb = self
+            .api_client
+            .fetch_formula_rb(ruby_source_path, &cache_dir, formula_rb_checksum)
+            .await?;
+
+        let mut installed_deps = std::collections::HashMap::new();
+        for dep_name in &build_plan.runtime_dependencies {
+            if let Some(keg) = self.db.get_installed(dep_name) {
+                installed_deps.insert(
+                    dep_name.clone(),
+                    crate::build::DepInfo {
+                        cellar_path: dependency_cellar_path(&self.cellar, &keg.name, &keg.version),
+                    },
+                );
+            }
+        }
+
+        let keg_path = self.cellar.keg_path(formula_name, &version);
+        let previous_keg_backup =
+            Self::backup_existing_source_keg(&keg_path, formula_name, &version)?;
+
+        let executor = crate::build::BuildExecutor::new(self.prefix.clone());
+        if let Err(build_err) = executor
+            .execute(build_plan, &formula_rb, &installed_deps)
+            .await
+        {
+            if let Some(backup_path) = previous_keg_backup.as_ref() {
+                Self::restore_source_keg_from_backup(
+                    &keg_path,
+                    backup_path,
+                    formula_name,
+                    &version,
+                )?;
+            }
+            return Err(build_err);
+        }
+
+        if let Some(backup_path) = previous_keg_backup.as_ref() {
+            Self::remove_source_keg_backup(backup_path, formula_name, &version)?;
+        }
+
+        report(InstallProgress::UnpackCompleted {
+            name: formula_name.clone(),
+        });
+
+        let store_key = format!("source:{formula_name}:{version}");
+
+        let tx = self.db.transaction().inspect_err(|_| {
+            Self::cleanup_materialized(&self.cellar, formula_name, &version);
+        })?;
+
+        if let Err(e) = tx.record_install(install_name, &version, &store_key) {
+            drop(tx);
+            Self::cleanup_materialized(&self.cellar, formula_name, &version);
+            return Err(e);
+        }
+
+        if let Err(e) = tx.commit() {
+            Self::cleanup_materialized(&self.cellar, formula_name, &version);
+            return Err(e);
+        }
+
+        if let Err(e) = self.linker.link_opt(&keg_path) {
+            warn!(formula = %install_name, error = %e, "failed to create opt link");
+        }
+
+        let should_link = link && !item.formula.is_keg_only();
+
+        if should_link {
+            report(InstallProgress::LinkStarted {
+                name: formula_name.clone(),
+            });
+            match self.linker.link_keg(&keg_path) {
+                Ok(files) => {
+                    report(InstallProgress::LinkCompleted {
+                        name: formula_name.clone(),
+                    });
+                    if !files.is_empty()
+                        && let Ok(tx) = self.db.transaction()
+                    {
+                        let mut ok = true;
+                        for linked in &files {
+                            if tx
+                                .record_linked_file(
+                                    install_name,
+                                    &version,
+                                    &linked.link_path.to_string_lossy(),
+                                    &linked.target_path.to_string_lossy(),
+                                )
+                                .is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            let _ = tx.commit();
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = self.linker.unlink_keg(&keg_path);
+                    report(InstallProgress::InstallCompleted {
+                        name: formula_name.clone(),
+                    });
+                    return Err(e);
+                }
+            }
+        } else if link && item.formula.is_keg_only() {
+            let reason = match &item.formula.keg_only {
+                zb_core::KegOnly::Reason(s) => s.clone(),
+                _ if item.formula.name.contains('@') => "versioned formula".to_string(),
+                _ => "keg-only formula".to_string(),
+            };
+            report(InstallProgress::LinkSkipped {
+                name: formula_name.clone(),
+                reason,
+            });
+        }
+
+        report(InstallProgress::InstallCompleted {
+            name: formula_name.clone(),
+        });
+        Ok(())
+    }
+
+    fn backup_existing_source_keg(
+        keg_path: &Path,
+        formula_name: &str,
+        version: &str,
+    ) -> Result<Option<PathBuf>, Error> {
+        if !keg_path.exists() {
+            return Ok(None);
+        }
+
+        let backup_path = Self::source_keg_backup_path(keg_path);
+        if backup_path.exists() {
+            fs::remove_dir_all(&backup_path).map_err(|e| Error::StoreCorruption {
+                message: format!(
+                    "failed to remove stale source-build backup for '{}@{}': {}",
+                    formula_name, version, e
+                ),
+            })?;
+        }
+
+        fs::rename(keg_path, &backup_path).map_err(|e| Error::StoreCorruption {
+            message: format!(
+                "failed to backup existing keg for '{}@{}': {}",
+                formula_name, version, e
+            ),
+        })?;
+
+        Ok(Some(backup_path))
+    }
+
+    fn restore_source_keg_from_backup(
+        keg_path: &Path,
+        backup_path: &Path,
+        formula_name: &str,
+        version: &str,
+    ) -> Result<(), Error> {
+        if keg_path.exists() {
+            fs::remove_dir_all(keg_path).map_err(|e| Error::StoreCorruption {
+                message: format!(
+                    "failed to remove failed source-build output for '{}@{}': {}",
+                    formula_name, version, e
+                ),
+            })?;
+        }
+
+        fs::rename(backup_path, keg_path).map_err(|e| Error::StoreCorruption {
+            message: format!(
+                "failed to restore previous keg for '{}@{}': {}",
+                formula_name, version, e
+            ),
+        })
+    }
+
+    fn remove_source_keg_backup(
+        backup_path: &Path,
+        formula_name: &str,
+        version: &str,
+    ) -> Result<(), Error> {
+        if !backup_path.exists() {
+            return Ok(());
+        }
+
+        fs::remove_dir_all(backup_path).map_err(|e| Error::StoreCorruption {
+            message: format!(
+                "failed to remove source-build backup for '{}@{}': {}",
+                formula_name, version, e
+            ),
+        })
+    }
+
+    fn source_keg_backup_path(keg_path: &Path) -> PathBuf {
+        let backup_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = keg_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "keg".to_string());
+
+        keg_path.with_file_name(format!("{name}.zb-backup-{backup_suffix}"))
+    }
+
+    /// Remove a materialized keg that was never registered in the database.
+    fn cleanup_materialized(cellar: &Cellar, name: &str, version: &str) {
+        if let Err(e) = cellar.remove_keg(name, version) {
+            warn!(
+                formula = %name,
+                version = %version,
+                error = %e,
+                "failed to remove keg after install error"
             );
         }
     }
 
     /// Convenience method to plan and execute in one call
     pub async fn install(&mut self, names: &[String], link: bool) -> Result<ExecuteResult, Error> {
-        let plan = self.plan(names).await?;
-        self.execute(plan, link).await
+        let (casks, formulas): (Vec<_>, Vec<_>) = names
+            .iter()
+            .cloned()
+            .partition(|name| name.starts_with("cask:"));
+
+        let mut installed = 0usize;
+
+        if !formulas.is_empty() {
+            let plan = self.plan(&formulas).await?;
+            installed += self.execute(plan, link).await?.installed;
+        }
+
+        if !casks.is_empty() {
+            installed += self.install_casks(&casks, link).await?.installed;
+        }
+
+        Ok(ExecuteResult { installed })
+    }
+
+    pub async fn install_casks(
+        &mut self,
+        names: &[String],
+        link: bool,
+    ) -> Result<ExecuteResult, Error> {
+        let mut installed = 0usize;
+        for name in names {
+            let token = name
+                .strip_prefix("cask:")
+                .expect("install_casks expects cask: prefixed names");
+            self.install_single_cask(token, link).await?;
+            installed += 1;
+        }
+        Ok(ExecuteResult { installed })
     }
 
     /// Uninstall a formula
@@ -478,9 +968,10 @@ impl Installer {
         let installed = self.db.get_installed(name).ok_or(Error::NotInstalled {
             name: name.to_string(),
         })?;
+        let keg_name = formula_token(&installed.name);
 
         // Unlink executables
-        let keg_path = self.cellar.keg_path(name, &installed.version);
+        let keg_path = self.cellar.keg_path(keg_name, &installed.version);
         self.linker.unlink_keg(&keg_path)?;
 
         // Remove from database (decrements store ref)
@@ -491,7 +982,7 @@ impl Installer {
         }
 
         // Remove cellar entry
-        self.cellar.remove_keg(name, &installed.version)?;
+        self.cellar.remove_keg(keg_name, &installed.version)?;
 
         Ok(())
     }
@@ -529,6 +1020,258 @@ impl Installer {
     pub fn keg_path(&self, name: &str, version: &str) -> std::path::PathBuf {
         self.cellar.keg_path(name, version)
     }
+    async fn install_single_cask(&mut self, token: &str, link: bool) -> Result<(), Error> {
+        let cask_json = self.api_client.get_cask(token).await?;
+        let cask = resolve_cask(token, &cask_json)?;
+
+        let blob_path = self
+            .downloader
+            .download_single(
+                DownloadRequest {
+                    url: cask.url.clone(),
+                    sha256: cask.sha256.clone(),
+                    name: cask.install_name.clone(),
+                },
+                None,
+            )
+            .await?;
+
+        let keg_path = self.cellar.keg_path(&cask.install_name, &cask.version);
+        let mut cleanup = FailedInstallGuard::new(
+            &self.linker,
+            &self.cellar,
+            &cask.install_name,
+            &cask.version,
+            &keg_path,
+            link,
+        );
+
+        if crate::extraction::is_archive(&blob_path)? {
+            let extracted = self.store.ensure_entry(&cask.sha256, &blob_path)?;
+            stage_cask_binaries(&extracted, &keg_path, &cask)?;
+        } else {
+            stage_raw_cask_binary(&blob_path, &keg_path, &cask)?;
+        }
+
+        let linked_files = if link {
+            self.linker.link_keg(&keg_path)?
+        } else {
+            Vec::new()
+        };
+
+        let tx = self.db.transaction()?;
+        tx.record_install(&cask.install_name, &cask.version, &cask.sha256)?;
+        for linked in &linked_files {
+            tx.record_linked_file(
+                &cask.install_name,
+                &cask.version,
+                &linked.link_path.to_string_lossy(),
+                &linked.target_path.to_string_lossy(),
+            )?;
+        }
+        tx.commit()?;
+
+        cleanup.disarm();
+        Ok(())
+    }
+}
+
+fn dependency_cellar_path(cellar: &Cellar, installed_name: &str, version: &str) -> String {
+    cellar
+        .keg_path(formula_token(installed_name), version)
+        .display()
+        .to_string()
+}
+
+struct FailedInstallGuard<'a> {
+    linker: &'a Linker,
+    cellar: &'a Cellar,
+    name: &'a str,
+    version: &'a str,
+    keg_path: &'a Path,
+    unlink: bool,
+    armed: bool,
+}
+
+impl<'a> FailedInstallGuard<'a> {
+    fn new(
+        linker: &'a Linker,
+        cellar: &'a Cellar,
+        name: &'a str,
+        version: &'a str,
+        keg_path: &'a Path,
+        unlink: bool,
+    ) -> Self {
+        Self {
+            linker,
+            cellar,
+            name,
+            version,
+            keg_path,
+            unlink,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailedInstallGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            Installer::cleanup_failed_install(
+                self.linker,
+                self.cellar,
+                self.name,
+                self.version,
+                self.keg_path,
+                self.unlink,
+            );
+        }
+    }
+}
+
+fn stage_cask_binaries(
+    extracted_root: &Path,
+    keg_path: &Path,
+    cask: &crate::installer::cask::ResolvedCask,
+) -> Result<(), Error> {
+    let bin_dir = keg_path.join("bin");
+    fs::create_dir_all(&bin_dir).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to create cask bin dir: {e}"),
+    })?;
+
+    for binary in &cask.binaries {
+        let source = resolve_cask_source_path(extracted_root, cask, &binary.source)?;
+        if !source.exists() {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "cask '{}' binary source '{}' not found in archive",
+                    cask.token, binary.source
+                ),
+            });
+        }
+
+        let target = bin_dir.join(&binary.target);
+        if target.exists() {
+            fs::remove_file(&target).map_err(|e| Error::StoreCorruption {
+                message: format!("failed to replace existing cask binary: {e}"),
+            })?;
+        }
+
+        fs::copy(&source, &target).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to stage cask binary '{}': {e}", binary.target),
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&target)
+                .map_err(|e| Error::StoreCorruption {
+                    message: format!("failed to read staged cask binary metadata: {e}"),
+                })?
+                .permissions();
+            if perms.mode() & 0o111 == 0 {
+                perms.set_mode(0o755);
+                fs::set_permissions(&target, perms).map_err(|e| Error::StoreCorruption {
+                    message: format!("failed to make staged cask binary executable: {e}"),
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn stage_raw_cask_binary(
+    blob_path: &Path,
+    keg_path: &Path,
+    cask: &crate::installer::cask::ResolvedCask,
+) -> Result<(), Error> {
+    if cask.binaries.len() != 1 {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "cask '{}' has {} binary artifacts but the download is a raw binary; expected exactly 1",
+                cask.token,
+                cask.binaries.len()
+            ),
+        });
+    }
+
+    let binary = &cask.binaries[0];
+    let bin_dir = keg_path.join("bin");
+    fs::create_dir_all(&bin_dir).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to create cask bin dir: {e}"),
+    })?;
+
+    let target = bin_dir.join(&binary.target);
+    if target.exists() {
+        fs::remove_file(&target).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to replace existing cask binary: {e}"),
+        })?;
+    }
+
+    fs::copy(blob_path, &target).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to stage cask binary '{}': {e}", binary.target),
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).map_err(|e| {
+            Error::StoreCorruption {
+                message: format!("failed to make staged cask binary executable: {e}"),
+            }
+        })?;
+    }
+
+    Ok(())
+}
+
+fn resolve_cask_source_path(
+    extracted_root: &Path,
+    cask: &crate::installer::cask::ResolvedCask,
+    source: &str,
+) -> Result<std::path::PathBuf, Error> {
+    if source.starts_with("$APPDIR") {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "cask '{}' uses APPDIR artifacts which are not supported yet",
+                cask.token
+            ),
+        });
+    }
+
+    let mut normalized = source.to_string();
+    let caskroom_prefix = format!("$HOMEBREW_PREFIX/Caskroom/{}/{}/", cask.token, cask.version);
+    if let Some(stripped) = normalized.strip_prefix(&caskroom_prefix) {
+        normalized = stripped.to_string();
+    }
+
+    let source_path = Path::new(&normalized);
+    if source_path.is_absolute() {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "cask '{}' binary source '{}' must be a relative path",
+                cask.token, source
+            ),
+        });
+    }
+
+    for component in source_path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "cask '{}' binary source '{}' cannot contain '..'",
+                    cask.token, source
+                ),
+            });
+        }
+    }
+
+    Ok(extracted_root.join(source_path))
 }
 
 /// Create an Installer with standard paths
@@ -565,7 +1308,21 @@ pub fn create_installer(
         message: format!("failed to create db directory: {e}"),
     })?;
 
-    let api_client = ApiClient::new();
+    fs::create_dir_all(root.join("cache")).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to create cache directory: {e}"),
+    })?;
+
+    let api_cache_path = root.join("cache/api-cache.sqlite");
+    let api_cache = ApiCache::open(&api_cache_path).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to open API cache: {e}"),
+    })?;
+
+    let api_client = match std::env::var("ZEROBREW_API_URL") {
+        Ok(url) => ApiClient::with_base_url(url)?,
+        Err(_) => ApiClient::new(),
+    }
+    .with_cache(api_cache);
+
     let blob_cache = BlobCache::new(&root.join("cache")).map_err(|e| Error::StoreCorruption {
         message: format!("failed to create blob cache: {e}"),
     })?;
@@ -591,6 +1348,7 @@ pub fn create_installer(
         cellar,
         linker,
         db,
+        prefix: prefix.to_path_buf(),
     })
 }
 
@@ -646,6 +1404,111 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dependency_cellar_path_uses_formula_token_for_tap_name() {
+        let tmp = TempDir::new().unwrap();
+        let cellar = Cellar::new(tmp.path()).unwrap();
+        let path = dependency_cellar_path(&cellar, "hashicorp/tap/terraform", "1.10.0");
+
+        assert!(path.ends_with("cellar/terraform/1.10.0"));
+    }
+
+    #[test]
+    fn dependency_cellar_path_keeps_core_formula_name() {
+        let tmp = TempDir::new().unwrap();
+        let cellar = Cellar::new(tmp.path()).unwrap();
+        let path = dependency_cellar_path(&cellar, "openssl@3", "3.3.2");
+
+        assert!(path.ends_with("cellar/openssl@3/3.3.2"));
+    }
+
+    #[test]
+    fn dependency_cellar_path_uses_name_from_db_record() {
+        let tmp = TempDir::new().unwrap();
+        let cellar = Cellar::new(tmp.path()).unwrap();
+
+        let db_path = tmp.path().join("zb.sqlite3");
+        let mut db = Database::open(&db_path).unwrap();
+        let tx = db.transaction().unwrap();
+        tx.record_install("hashicorp/tap/terraform", "1.10.0", "store-key")
+            .unwrap();
+        tx.commit().unwrap();
+
+        let keg = db.get_installed("hashicorp/tap/terraform").unwrap();
+        let path = dependency_cellar_path(&cellar, &keg.name, &keg.version);
+
+        assert!(path.ends_with("cellar/terraform/1.10.0"));
+    }
+
+    #[test]
+    fn source_keg_backup_can_restore_previous_installation() {
+        let tmp = TempDir::new().unwrap();
+        let keg_path = tmp.path().join("cellar").join("example").join("1.0.0");
+        fs::create_dir_all(&keg_path).unwrap();
+        fs::write(keg_path.join("old.txt"), "old").unwrap();
+
+        let backup = Installer::backup_existing_source_keg(&keg_path, "example", "1.0.0").unwrap();
+        let backup = backup.expect("backup path should exist");
+
+        assert!(!keg_path.exists());
+        assert!(backup.exists());
+
+        fs::create_dir_all(&keg_path).unwrap();
+        fs::write(keg_path.join("new.txt"), "new").unwrap();
+
+        Installer::restore_source_keg_from_backup(&keg_path, &backup, "example", "1.0.0").unwrap();
+
+        assert!(keg_path.join("old.txt").exists());
+        assert!(!keg_path.join("new.txt").exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn backup_existing_source_keg_returns_none_when_keg_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let missing_keg = tmp.path().join("cellar").join("example").join("1.0.0");
+
+        let backup =
+            Installer::backup_existing_source_keg(&missing_keg, "example", "1.0.0").unwrap();
+
+        assert!(backup.is_none());
+    }
+
+    #[tokio::test]
+    async fn suggest_formulas_returns_matches_from_api_client() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let bulk = r#"[
+            {"name":"python"},
+            {"name":"pytest"},
+            {"name":"pypy"}
+        ]"#;
+
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bulk))
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, prefix);
+
+        let suggestions = installer.suggest_formulas("pythn", 3).await.unwrap();
+        assert_eq!(suggestions.first().map(String::as_str), Some("python"));
+    }
+
     #[tokio::test]
     async fn install_completes_successfully() {
         let mock_server = MockServer::start().await;
@@ -681,7 +1544,7 @@ mod tests {
 
         // Mount formula API mock
         Mock::given(method("GET"))
-            .and(path("/testpkg.json"))
+            .and(path("/formula/testpkg.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&formula_json))
             .mount(&mock_server)
             .await;
@@ -701,14 +1564,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Install
         installer
@@ -763,7 +1635,7 @@ mod tests {
 
         // Mount mocks
         Mock::given(method("GET"))
-            .and(path("/uninstallme.json"))
+            .and(path("/formula/uninstallme.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&formula_json))
             .mount(&mock_server)
             .await;
@@ -782,14 +1654,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Install
         installer
@@ -846,7 +1727,7 @@ mod tests {
 
         // Mount mocks
         Mock::given(method("GET"))
-            .and(path("/gctest.json"))
+            .and(path("/formula/gctest.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&formula_json))
             .mount(&mock_server)
             .await;
@@ -862,14 +1743,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Install and uninstall
         installer
@@ -936,7 +1826,7 @@ mod tests {
 
         // Mount mocks
         Mock::given(method("GET"))
-            .and(path("/keepme.json"))
+            .and(path("/formula/keepme.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&formula_json))
             .mount(&mock_server)
             .await;
@@ -952,14 +1842,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Install but don't uninstall
         installer
@@ -1038,13 +1937,13 @@ mod tests {
 
         // Mount mocks
         Mock::given(method("GET"))
-            .and(path("/deplib.json"))
+            .and(path("/formula/deplib.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&dep_json))
             .mount(&mock_server)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/mainpkg.json"))
+            .and(path("/formula/mainpkg.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&main_json))
             .mount(&mock_server)
             .await;
@@ -1069,14 +1968,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Install main package (should also install dependency)
         installer
@@ -1087,6 +1995,250 @@ mod tests {
         // Both packages should be installed
         assert!(installer.db.get_installed("mainpkg").is_some());
         assert!(installer.db.get_installed("deplib").is_some());
+    }
+
+    #[tokio::test]
+    async fn plans_tapped_formula_with_core_dependency() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let dep_bottle = create_bottle_tarball("go");
+        let dep_sha = sha256_hex(&dep_bottle);
+        let tag = get_test_bottle_tag();
+        let dep_json = format!(
+            r#"{{
+                "name": "go",
+                "versions": {{ "stable": "1.24.0" }},
+                "dependencies": [],
+                "bottle": {{
+                    "stable": {{
+                        "files": {{
+                            "{}": {{
+                                "url": "{}/bottles/go-1.24.0.{}.bottle.tar.gz",
+                                "sha256": "{}"
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            tag,
+            mock_server.uri(),
+            tag,
+            dep_sha
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/formula/go.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&dep_json))
+            .mount(&mock_server)
+            .await;
+
+        let tap_formula_rb = format!(
+            r#"
+class Terraform < Formula
+  version "1.10.0"
+  depends_on "go"
+  bottle do
+    root_url "{}/ghcr/hashicorp/tap"
+    sha256 {}: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  end
+end
+"#,
+            mock_server.uri(),
+            tag
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/hashicorp/homebrew-tap/main/Formula/terraform.rb"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tap_formula_rb))
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client = ApiClient::with_base_url(format!("{}/formula", mock_server.uri()))
+            .unwrap()
+            .with_tap_raw_base_url(mock_server.uri());
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.to_path_buf(),
+        );
+        let plan = installer
+            .plan(&["hashicorp/tap/terraform".to_string()])
+            .await
+            .unwrap();
+
+        let planned_names: Vec<String> = plan
+            .items
+            .iter()
+            .map(|item| item.formula.name.clone())
+            .collect();
+        assert!(planned_names.contains(&"terraform".to_string()));
+        assert!(planned_names.contains(&"go".to_string()));
+    }
+
+    #[tokio::test]
+    async fn uninstall_accepts_full_tap_reference_after_install() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let bottle = create_bottle_tarball("terraform");
+        let sha = sha256_hex(&bottle);
+        let tag = get_test_bottle_tag();
+
+        let tap_formula_rb = format!(
+            r#"
+class Terraform < Formula
+  version "1.10.0"
+  bottle do
+    root_url "{}/v2/hashicorp/tap"
+    sha256 {}: "{}"
+  end
+end
+"#,
+            mock_server.uri(),
+            tag,
+            sha
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/hashicorp/homebrew-tap/main/Formula/terraform.rb"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tap_formula_rb))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/hashicorp/tap/terraform/blobs/sha256:{sha}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle))
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client = ApiClient::with_base_url(format!("{}/formula", mock_server.uri()))
+            .unwrap()
+            .with_tap_raw_base_url(mock_server.uri());
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.to_path_buf(),
+        );
+
+        installer
+            .install(&["hashicorp/tap/terraform".to_string()], true)
+            .await
+            .unwrap();
+
+        assert!(installer.is_installed("hashicorp/tap/terraform"));
+        assert!(!installer.is_installed("terraform"));
+        assert!(root.join("cellar/terraform/1.10.0").exists());
+        installer.uninstall("hashicorp/tap/terraform").unwrap();
+        assert!(!installer.is_installed("hashicorp/tap/terraform"));
+        assert!(!root.join("cellar/terraform/1.10.0").exists());
+    }
+
+    #[tokio::test]
+    async fn uninstalling_non_installed_tap_ref_does_not_remove_core_formula() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let bottle = create_bottle_tarball("terraform");
+        let sha = sha256_hex(&bottle);
+        let tag = get_test_bottle_tag();
+        let core_json = format!(
+            r#"{{
+                "name": "terraform",
+                "versions": {{ "stable": "1.10.0" }},
+                "dependencies": [],
+                "bottle": {{
+                    "stable": {{
+                        "files": {{
+                            "{}": {{
+                                "url": "{}/bottles/terraform-1.10.0.{}.bottle.tar.gz",
+                                "sha256": "{}"
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            tag,
+            mock_server.uri(),
+            tag,
+            sha
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/formula/terraform.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(core_json))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/bottles/terraform-1.10.0.{}.bottle.tar.gz",
+                tag
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle))
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.to_path_buf(),
+        );
+        installer
+            .install(&["terraform".to_string()], true)
+            .await
+            .unwrap();
+        assert!(installer.is_installed("terraform"));
+
+        let err = installer.uninstall("hashicorp/tap/terraform").unwrap_err();
+        assert!(matches!(err, Error::NotInstalled { .. }));
+        assert!(installer.is_installed("terraform"));
     }
 
     #[tokio::test]
@@ -1145,13 +2297,13 @@ mod tests {
         );
 
         Mock::given(method("GET"))
-            .and(path("/goodpkg.json"))
+            .and(path("/formula/goodpkg.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&good_json))
             .mount(&mock_server)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/badpkg.json"))
+            .and(path("/formula/badpkg.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&bad_json))
             .mount(&mock_server)
             .await;
@@ -1179,14 +2331,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         let result = installer
             .install(&["goodpkg".to_string(), "badpkg".to_string()], false)
@@ -1230,7 +2391,7 @@ mod tests {
         );
 
         Mock::given(method("GET"))
-            .and(path("/rollbackme.json"))
+            .and(path("/formula/rollbackme.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&formula_json))
             .mount(&mock_server)
             .await;
@@ -1249,14 +2410,23 @@ mod tests {
         fs::create_dir_all(root.join("db")).unwrap();
 
         let db_path = root.join("db/zb.sqlite3");
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&db_path).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Force metadata persistence to fail after filesystem work is done.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1268,6 +2438,84 @@ mod tests {
         assert!(!root.join("cellar/rollbackme/1.0.0").exists());
         assert!(!prefix.join("bin/rollbackme").exists());
         assert!(!prefix.join("opt/rollbackme").exists());
+        assert!(root.join("store").join(&bottle_sha).exists());
+    }
+
+    #[tokio::test]
+    async fn db_persist_failure_cleans_materialized_tap_formula_keg() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let bottle = create_bottle_tarball("terraform");
+        let bottle_sha = sha256_hex(&bottle);
+        let tag = get_test_bottle_tag();
+
+        let tap_formula_rb = format!(
+            r#"
+class Terraform < Formula
+  version "1.10.0"
+  bottle do
+    root_url "{}/v2/hashicorp/tap"
+    sha256 {}: "{}"
+  end
+end
+"#,
+            mock_server.uri(),
+            tag,
+            bottle_sha
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/hashicorp/homebrew-tap/main/Formula/terraform.rb"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tap_formula_rb))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/hashicorp/tap/terraform/blobs/sha256:{bottle_sha}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle))
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let db_path = root.join("db/zb.sqlite3");
+        let api_client = ApiClient::with_base_url(format!("{}/formula", mock_server.uri()))
+            .unwrap()
+            .with_tap_raw_base_url(mock_server.uri());
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&db_path).unwrap();
+
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
+
+        // Force metadata persistence to fail after filesystem work is done.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DROP TABLE installed_kegs", []).unwrap();
+
+        let result = installer
+            .install(&["hashicorp/tap/terraform".to_string()], true)
+            .await;
+        assert!(result.is_err());
+
+        // Keg is materialized at canonical formula name, so rollback must remove this path.
+        assert!(!root.join("cellar/terraform/1.10.0").exists());
+        assert!(!prefix.join("bin/terraform").exists());
+        assert!(!prefix.join("opt/terraform").exists());
         assert!(root.join("store").join(&bottle_sha).exists());
     }
 
@@ -1334,7 +2582,7 @@ mod tests {
             ("root", &root_json),
         ] {
             Mock::given(method("GET"))
-                .and(path(format!("/{}.json", name)))
+                .and(path(format!("/formula/{}.json", name)))
                 .respond_with(ResponseTemplate::new(200).set_body_string(json))
                 .mount(&mock_server)
                 .await;
@@ -1357,14 +2605,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Install root (should install all 5 packages)
         installer
@@ -1414,13 +2671,13 @@ mod tests {
 
         // Mount API mocks
         Mock::given(method("GET"))
-            .and(path("/fastpkg.json"))
+            .and(path("/formula/fastpkg.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&fast_json))
             .mount(&mock_server)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/slowpkg.json"))
+            .and(path("/formula/slowpkg.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&slow_json))
             .mount(&mock_server)
             .await;
@@ -1447,14 +2704,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Install slow package (which depends on fast)
         // With streaming, fast should be extracted while slow is still downloading
@@ -1513,7 +2779,7 @@ mod tests {
 
         // Mount formula API mock
         Mock::given(method("GET"))
-            .and(path("/retrypkg.json"))
+            .and(path("/formula/retrypkg.json"))
             .respond_with(ResponseTemplate::new(200).set_body_string(&formula_json))
             .mount(&mock_server)
             .await;
@@ -1554,14 +2820,23 @@ mod tests {
         let prefix = tmp.path().join("homebrew");
         fs::create_dir_all(root.join("db")).unwrap();
 
-        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
         let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
         let store = Store::new(&root).unwrap();
         let cellar = Cellar::new(&root).unwrap();
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db);
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
 
         // Install - should succeed (first download is valid in this test)
         installer
@@ -1590,5 +2865,471 @@ mod tests {
         // - Second attempt: re-download, extraction fails (corruption)
         // - Third attempt: re-download, extraction fails (corruption)
         // - Returns error: "Failed after 3 attempts..."
+    }
+
+    #[tokio::test]
+    async fn plan_falls_back_to_source_when_no_bottle() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let formula_json = r#"{
+            "name": "nobottle",
+            "versions": { "stable": "1.0.0" },
+            "dependencies": [],
+            "build_dependencies": ["pkgconf"],
+            "urls": {
+                "stable": {
+                    "url": "https://example.com/nobottle-1.0.0.tar.gz",
+                    "checksum": "abc123"
+                }
+            },
+            "ruby_source_path": "Formula/n/nobottle.rb",
+            "bottle": { "stable": { "files": {} } }
+        }"#;
+
+        Mock::given(method("GET"))
+            .and(path("/formula/nobottle.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(formula_json))
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
+
+        let plan = installer.plan(&["nobottle".to_string()]).await.unwrap();
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].formula.name, "nobottle");
+        assert!(matches!(
+            plan.items[0].method,
+            zb_core::InstallMethod::Source(_)
+        ));
+
+        if let zb_core::InstallMethod::Source(ref bp) = plan.items[0].method {
+            assert_eq!(bp.source_url, "https://example.com/nobottle-1.0.0.tar.gz");
+            assert_eq!(bp.formula_name, "nobottle");
+            assert_eq!(bp.build_dependencies, vec!["pkgconf"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_prefers_bottle_over_source() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let tag = get_test_bottle_tag();
+        let formula_json = format!(
+            r#"{{
+                "name": "hasboth",
+                "versions": {{ "stable": "2.0.0" }},
+                "dependencies": [],
+                "urls": {{
+                    "stable": {{
+                        "url": "https://example.com/hasboth-2.0.0.tar.gz",
+                        "checksum": "def456"
+                    }}
+                }},
+                "ruby_source_path": "Formula/h/hasboth.rb",
+                "bottle": {{
+                    "stable": {{
+                        "files": {{
+                            "{}": {{
+                                "url": "https://example.com/hasboth.bottle.tar.gz",
+                                "sha256": "aabbccdd"
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            tag
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/formula/hasboth.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&formula_json))
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
+
+        let plan = installer.plan(&["hasboth".to_string()]).await.unwrap();
+
+        assert_eq!(plan.items.len(), 1);
+        assert!(matches!(
+            plan.items[0].method,
+            zb_core::InstallMethod::Bottle(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn plan_errors_when_no_bottle_and_no_source() {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        let formula_json = r#"{
+            "name": "nothing",
+            "versions": { "stable": "1.0.0" },
+            "dependencies": [],
+            "bottle": { "stable": { "files": {} } }
+        }"#;
+
+        Mock::given(method("GET"))
+            .and(path("/formula/nothing.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(formula_json))
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            prefix.clone(),
+        );
+
+        let result = installer.plan(&["nothing".to_string()]).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            zb_core::Error::MissingFormula { .. }
+        ));
+    }
+
+    /// Helper: create a minimal Installer backed by a mock server and temp dir.
+    /// Returns (installer, mock_server, tmp_dir).
+    async fn test_installer() -> (Installer, MockServer, TempDir) {
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client =
+            ApiClient::with_base_url(format!("{}/formula", mock_server.uri())).unwrap();
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, prefix);
+        (installer, mock_server, tmp)
+    }
+
+    fn formula_json(name: &str, version: &str, sha256: &str) -> String {
+        let tag = get_test_bottle_tag();
+        format!(
+            r#"{{
+                "name": "{}",
+                "versions": {{ "stable": "{}" }},
+                "dependencies": [],
+                "bottle": {{
+                    "stable": {{
+                        "files": {{
+                            "{}": {{
+                                "url": "https://example.com/{}-{}.{}.bottle.tar.gz",
+                                "sha256": "{}"
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            name, version, tag, name, version, tag, sha256
+        )
+    }
+
+    #[tokio::test]
+    async fn is_outdated_returns_none_when_sha256_matches() {
+        let (mut installer, mock_server, _tmp) = test_installer().await;
+        let sha = "abc123def456";
+
+        {
+            let tx = installer.db.transaction().unwrap();
+            tx.record_install("jq", "1.7.1", sha).unwrap();
+            tx.commit().unwrap();
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/formula/jq.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(formula_json("jq", "1.7.1", sha)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let result = installer.is_outdated("jq").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn is_outdated_returns_some_when_sha256_differs() {
+        let (mut installer, mock_server, _tmp) = test_installer().await;
+
+        {
+            let tx = installer.db.transaction().unwrap();
+            tx.record_install("jq", "1.7.0", "old_sha256").unwrap();
+            tx.commit().unwrap();
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/formula/jq.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(formula_json(
+                "jq",
+                "1.7.1",
+                "new_sha256",
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let result = installer.is_outdated("jq").await.unwrap().unwrap();
+        assert_eq!(result.name, "jq");
+        assert_eq!(result.installed_version, "1.7.0");
+        assert_eq!(result.current_version, "1.7.1");
+        assert!(!result.is_source_build);
+    }
+
+    #[tokio::test]
+    async fn is_outdated_errors_for_not_installed() {
+        let (installer, _mock_server, _tmp) = test_installer().await;
+
+        let err = installer.is_outdated("jq").await.unwrap_err();
+        assert!(matches!(err, zb_core::Error::NotInstalled { .. }));
+    }
+
+    #[tokio::test]
+    async fn is_outdated_source_build_compares_version_only() {
+        let (mut installer, mock_server, _tmp) = test_installer().await;
+
+        {
+            let tx = installer.db.transaction().unwrap();
+            tx.record_install("jq", "1.7.1", "source:jq:1.7.1").unwrap();
+            tx.commit().unwrap();
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/formula/jq.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(formula_json(
+                "jq",
+                "1.7.1",
+                "irrelevant",
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let result = installer.is_outdated("jq").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn is_outdated_source_build_detects_new_version() {
+        let (mut installer, mock_server, _tmp) = test_installer().await;
+
+        {
+            let tx = installer.db.transaction().unwrap();
+            tx.record_install("jq", "1.6", "source:jq:1.6").unwrap();
+            tx.commit().unwrap();
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/formula/jq.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(formula_json(
+                "jq",
+                "1.7.1",
+                "irrelevant",
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let result = installer.is_outdated("jq").await.unwrap().unwrap();
+        assert_eq!(result.installed_version, "1.6");
+        assert_eq!(result.current_version, "1.7.1");
+        assert!(result.is_source_build);
+    }
+
+    #[tokio::test]
+    async fn check_outdated_empty_when_nothing_installed() {
+        let (installer, _mock_server, _tmp) = test_installer().await;
+
+        let (outdated, warnings) = installer.check_outdated().await.unwrap();
+        assert!(outdated.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_outdated_continues_on_network_failure() {
+        let (mut installer, mock_server, _tmp) = test_installer().await;
+
+        {
+            let tx = installer.db.transaction().unwrap();
+            tx.record_install("good", "1.0.0", "old_sha").unwrap();
+            tx.record_install("bad", "1.0.0", "old_sha").unwrap();
+            tx.commit().unwrap();
+        }
+
+        let bulk = format!("[{}]", formula_json("good", "2.0.0", "new_sha"));
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bulk))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/formula/bad.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let (outdated, warnings) = installer.check_outdated().await.unwrap();
+        assert_eq!(outdated.len(), 1);
+        assert_eq!(outdated[0].name, "good");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bad"));
+    }
+
+    #[tokio::test]
+    async fn check_outdated_warns_on_missing_bottle() {
+        let (mut installer, mock_server, _tmp) = test_installer().await;
+
+        {
+            let tx = installer.db.transaction().unwrap();
+            tx.record_install("nobottle", "1.0.0", "old_sha").unwrap();
+            tx.commit().unwrap();
+        }
+
+        let bulk = r#"[{
+            "name": "nobottle",
+            "versions": { "stable": "2.0.0" },
+            "dependencies": [],
+            "bottle": { "stable": { "files": {} } }
+        }]"#;
+
+        Mock::given(method("GET"))
+            .and(path("/formula.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bulk))
+            .mount(&mock_server)
+            .await;
+
+        let (outdated, warnings) = installer.check_outdated().await.unwrap();
+        assert!(outdated.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("nobottle"));
+    }
+
+    #[test]
+    fn stage_raw_cask_binary_copies_and_marks_executable() {
+        let tmp = TempDir::new().unwrap();
+        let blob_path = tmp.path().join("claude");
+        fs::write(&blob_path, b"#!/bin/sh\necho hello").unwrap();
+
+        let keg_path = tmp.path().join("keg");
+        let cask = crate::installer::cask::ResolvedCask {
+            install_name: "cask:claude-code".to_string(),
+            token: "claude-code".to_string(),
+            version: "1.0.0".to_string(),
+            url: "https://example.com/claude".to_string(),
+            sha256: "aaa".to_string(),
+            binaries: vec![crate::installer::cask::CaskBinary {
+                source: "claude".to_string(),
+                target: "claude".to_string(),
+            }],
+        };
+
+        stage_raw_cask_binary(&blob_path, &keg_path, &cask).unwrap();
+
+        let target = keg_path.join("bin/claude");
+        assert!(target.exists());
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\necho hello"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o755, 0o755);
+        }
+    }
+
+    #[test]
+    fn stage_raw_cask_binary_rejects_multiple_binaries() {
+        let tmp = TempDir::new().unwrap();
+        let blob_path = tmp.path().join("blob");
+        fs::write(&blob_path, b"data").unwrap();
+
+        let keg_path = tmp.path().join("keg");
+        let cask = crate::installer::cask::ResolvedCask {
+            install_name: "cask:multi".to_string(),
+            token: "multi".to_string(),
+            version: "1.0.0".to_string(),
+            url: "https://example.com/multi".to_string(),
+            sha256: "bbb".to_string(),
+            binaries: vec![
+                crate::installer::cask::CaskBinary {
+                    source: "a".to_string(),
+                    target: "a".to_string(),
+                },
+                crate::installer::cask::CaskBinary {
+                    source: "b".to_string(),
+                    target: "b".to_string(),
+                },
+            ],
+        };
+
+        let err = stage_raw_cask_binary(&blob_path, &keg_path, &cask).unwrap_err();
+        assert!(err.to_string().contains("raw binary"));
     }
 }

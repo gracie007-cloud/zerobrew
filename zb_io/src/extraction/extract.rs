@@ -14,7 +14,12 @@ enum CompressionFormat {
     Gzip,
     Xz,
     Zstd,
+    Zip,
     Unknown,
+}
+
+pub fn is_archive(path: &Path) -> Result<bool, Error> {
+    detect_compression(path).map(|fmt| !matches!(fmt, CompressionFormat::Unknown))
 }
 
 fn detect_compression(path: &Path) -> Result<CompressionFormat, Error> {
@@ -46,14 +51,23 @@ fn detect_compression(path: &Path) -> Result<CompressionFormat, Error> {
         return Ok(CompressionFormat::Zstd);
     }
 
+    // ZIP: 50 4b 03 04
+    if bytes_read >= 4 && magic[0..4] == [0x50, 0x4b, 0x03, 0x04] {
+        return Ok(CompressionFormat::Zip);
+    }
+
     Ok(CompressionFormat::Unknown)
 }
 
 pub fn extract_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<(), Error> {
-    let format = detect_compression(tarball_path)?;
+    extract_archive(tarball_path, dest_dir)
+}
 
-    let file = File::open(tarball_path).map_err(|e| Error::StoreCorruption {
-        message: format!("failed to open tarball: {e}"),
+pub fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<(), Error> {
+    let format = detect_compression(archive_path)?;
+
+    let file = File::open(archive_path).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to open archive: {e}"),
     })?;
     let reader = BufReader::new(file);
 
@@ -72,6 +86,7 @@ pub fn extract_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<(), Error
             })?;
             extract_tar_archive(decoder, dest_dir)
         }
+        CompressionFormat::Zip => extract_zip_archive(archive_path, dest_dir),
         CompressionFormat::Unknown => {
             // Try gzip as fallback
             let decoder = GzDecoder::new(reader);
@@ -108,6 +123,63 @@ fn extract_tar_archive<R: Read>(reader: R, dest_dir: &Path) -> Result<(), Error>
             .map_err(|e| Error::StoreCorruption {
                 message: format!("failed to unpack entry {path_display}: {e}"),
             })?;
+    }
+
+    Ok(())
+}
+
+fn extract_zip_archive(path: &Path, dest_dir: &Path) -> Result<(), Error> {
+    let file = File::open(path).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to open zip archive: {e}"),
+    })?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| Error::StoreCorruption {
+        message: format!("failed to open zip archive: {e}"),
+    })?;
+
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to read zip entry: {e}"),
+        })?;
+        let Some(raw_path) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+            return Err(Error::StoreCorruption {
+                message: "zip entry with invalid path".to_string(),
+            });
+        };
+
+        validate_path(&raw_path, dest_dir)?;
+
+        let out_path = dest_dir.join(&raw_path);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| Error::StoreCorruption {
+                message: format!("failed to create output directory: {e}"),
+            })?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::StoreCorruption {
+                message: format!("failed to create output parent directory: {e}"),
+            })?;
+        }
+
+        let mut output = File::create(&out_path).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to create extracted file: {e}"),
+        })?;
+        std::io::copy(&mut entry, &mut output).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to extract zip entry: {e}"),
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = entry.unix_mode() {
+                let perms = std::fs::Permissions::from_mode(mode);
+                std::fs::set_permissions(&out_path, perms).map_err(|e| Error::StoreCorruption {
+                    message: format!("failed to set zip file permissions: {e}"),
+                })?;
+            }
+        }
     }
 
     Ok(())
@@ -274,6 +346,20 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn create_test_zip(entries: Vec<(&str, &[u8])>) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+
+        for (path, content) in entries {
+            zip.start_file(path, SimpleFileOptions::default()).unwrap();
+            zip.write_all(content).unwrap();
+        }
+
+        zip.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn extracts_file_with_content() {
         let tmp = TempDir::new().unwrap();
@@ -289,6 +375,23 @@ mod tests {
 
         let content = fs::read_to_string(dest.join("hello.txt")).unwrap();
         assert_eq!(content, "Hello, World!");
+    }
+
+    #[test]
+    fn extracts_zip_file_with_content() {
+        let tmp = TempDir::new().unwrap();
+        let zip_data = create_test_zip(vec![("op", b"#!/bin/sh\necho op")]);
+
+        let zip_path = tmp.path().join("test.zip");
+        fs::write(&zip_path, &zip_data).unwrap();
+
+        let dest = tmp.path().join("extracted");
+        fs::create_dir(&dest).unwrap();
+
+        extract_archive(&zip_path, &dest).unwrap();
+
+        let content = fs::read_to_string(dest.join("op")).unwrap();
+        assert_eq!(content, "#!/bin/sh\necho op");
     }
 
     #[test]
@@ -517,5 +620,31 @@ mod tests {
         let safe_path = PathBuf::from("foo/file.tar.gz");
         let result = validate_path(&safe_path, &dest);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn is_archive_true_for_gzip() {
+        let tmp = TempDir::new().unwrap();
+        let tarball = create_test_tarball(vec![("a.txt", b"a", None)]);
+        let path = tmp.path().join("test.tar.gz");
+        fs::write(&path, &tarball).unwrap();
+        assert!(is_archive(&path).unwrap());
+    }
+
+    #[test]
+    fn is_archive_true_for_zip() {
+        let tmp = TempDir::new().unwrap();
+        let zip_data = create_test_zip(vec![("a.txt", b"a")]);
+        let path = tmp.path().join("test.zip");
+        fs::write(&path, &zip_data).unwrap();
+        assert!(is_archive(&path).unwrap());
+    }
+
+    #[test]
+    fn is_archive_false_for_raw_binary() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("raw-binary");
+        fs::write(&path, b"\x7fELF raw executable bytes").unwrap();
+        assert!(!is_archive(&path).unwrap());
     }
 }
